@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from train.train import TrainConfig, train
+from train.train import TrainConfig, compute_value_loss, train
 
 
 @pytest.fixture
@@ -84,3 +84,42 @@ class TestTrainEma:
             tmp_path / "ckpt" / "final.pt", map_location="cpu", weights_only=False
         )
         assert "raw_model_state_dict" not in ckpt
+
+
+class TestComputeValueLoss:
+    """compute_value_lossのテスト."""
+
+    def test_mse_matches_functional(self) -> None:
+        value = torch.tensor([[0.5], [-0.3]])
+        target = torch.tensor([[0.2], [0.1]])
+        loss = compute_value_loss(value, target, "mse")
+        expected = torch.nn.functional.mse_loss(value, target)
+        assert torch.allclose(loss, expected)
+
+    def test_huber_small_error_quadratic(self) -> None:
+        """delta以内の誤差ではHuberはMSE/2と一致する."""
+        value = torch.tensor([[0.1]])
+        target = torch.tensor([[0.0]])
+        loss = compute_value_loss(value, target, "huber", huber_delta=0.5)
+        assert torch.allclose(loss, torch.tensor(0.005), atol=1e-6)  # 0.5 * 0.1^2
+
+    def test_huber_large_error_linear(self) -> None:
+        """delta超の誤差ではHuberはMSEより小さくなる（外れ値にロバスト）."""
+        value = torch.tensor([[2.0]])
+        target = torch.tensor([[0.0]])
+        huber = compute_value_loss(value, target, "huber", huber_delta=0.5)
+        mse = compute_value_loss(value, target, "mse")
+        assert huber.item() < mse.item()
+
+    def test_unknown_loss_raises(self) -> None:
+        value = torch.zeros(1, 1)
+        with pytest.raises(ValueError):
+            compute_value_loss(value, value, "unknown")
+
+    def test_train_with_huber(self, small_data: Path, tmp_path: Path) -> None:
+        """Huber lossで学習が正常に完了する."""
+        config = _small_config(
+            small_data, tmp_path / "ckpt", value_loss="huber", huber_delta=0.5
+        )
+        train(config)
+        assert (tmp_path / "ckpt" / "final.pt").exists()

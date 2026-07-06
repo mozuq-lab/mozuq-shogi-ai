@@ -108,6 +108,10 @@ class TrainConfig:
     # 0で無効。有効時（推奨: 0.999）はvalidateとbest.pt保存にEMA重みを使用
     ema_decay: float = 0.0
 
+    # 評価値損失の種類（mse: 二乗誤差, huber: 教師の探索ノイズにロバスト）
+    value_loss: str = "mse"
+    huber_delta: float = 0.5
+
 
 @dataclass
 class TrainState:
@@ -118,6 +122,30 @@ class TrainState:
     best_val_loss: float = float("inf")
     train_losses: list[float] = field(default_factory=list)
     val_losses: list[float] = field(default_factory=list)
+
+
+def compute_value_loss(
+    value: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 0.5,
+) -> torch.Tensor:
+    """評価値損失を計算.
+
+    Args:
+        value: モデル出力 (batch, 1)
+        target: ターゲット (batch, 1)
+        loss_type: 損失の種類（"mse" または "huber"）
+        huber_delta: Huber lossの遷移点
+
+    Returns:
+        損失テンソル（スカラー）
+    """
+    if loss_type == "huber":
+        return nn.functional.huber_loss(value, target, delta=huber_delta)
+    if loss_type == "mse":
+        return nn.functional.mse_loss(value, target)
+    raise ValueError(f"Unknown value_loss: {loss_type}")
 
 
 def split_by_game(
@@ -275,6 +303,8 @@ def train_epoch(
     label_smoothing: float = 0.05,
     variance_reg_weight: float = 0.1,
     ema_model: AveragedModel | None = None,
+    value_loss_type: str = "mse",
+    huber_delta: float = 0.5,
 ) -> float:
     """1エポック学習."""
     model.train()
@@ -309,7 +339,9 @@ def train_epoch(
         # 念のため形状を再確認して強制的に合わせる
         value = value.view(-1, 1)
         target_value = target_value.view(-1, 1)
-        value_loss = nn.functional.mse_loss(value, target_value)
+        value_loss = compute_value_loss(
+            value, target_value, value_loss_type, huber_delta
+        )
 
         # 勝敗損失（補助タスク、Label Smoothing適用）
         outcome = outcome.view(-1, 1)
@@ -359,6 +391,8 @@ def validate(
     device: torch.device,
     use_features: bool = False,
     aux_loss_weight: float = 0.1,
+    value_loss_type: str = "mse",
+    huber_delta: float = 0.5,
 ) -> float:
     """バリデーション."""
     model.eval()
@@ -378,7 +412,9 @@ def validate(
         value, outcome = model(board, hand, turn, features)
 
         # 評価値損失（主タスク）
-        value_loss = nn.functional.mse_loss(value, target_value)
+        value_loss = compute_value_loss(
+            value, target_value, value_loss_type, huber_delta
+        )
 
         # 勝敗損失（補助タスク）
         outcome_loss = nn.functional.binary_cross_entropy(outcome, target_outcome)
@@ -511,6 +547,8 @@ def train(config: TrainConfig) -> None:
             label_smoothing=config.label_smoothing,
             variance_reg_weight=config.variance_reg_weight,
             ema_model=ema_model,
+            value_loss_type=config.value_loss,
+            huber_delta=config.huber_delta,
         )
         state.train_losses.append(train_loss)
 
@@ -520,6 +558,8 @@ def train(config: TrainConfig) -> None:
             eval_model, val_loader, device,
             use_features=config.use_features,
             aux_loss_weight=config.aux_loss_weight,
+            value_loss_type=config.value_loss,
+            huber_delta=config.huber_delta,
         )
         state.val_losses.append(val_loss)
 
@@ -626,6 +666,10 @@ def main() -> None:
     # EMA
     parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA減衰率（0=無効、推奨: 0.999）")
 
+    # 評価値損失
+    parser.add_argument("--value-loss", type=str, default="mse", choices=["mse", "huber"], help="評価値損失の種類")
+    parser.add_argument("--huber-delta", type=float, default=0.5, help="Huber lossの遷移点")
+
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -659,6 +703,8 @@ def main() -> None:
         num_workers=args.num_workers,
         variance_reg_weight=args.variance_reg_weight,
         ema_decay=args.ema_decay,
+        value_loss=args.value_loss,
+        huber_delta=args.huber_delta,
     )
 
     train(config)
