@@ -15,6 +15,20 @@ from typing import Optional
 
 
 @dataclass
+class MultiPVEntry:
+    """MultiPVの候補手（1局面の上位N手のうちの1つ）"""
+    rank: int  # multipv順位（1が最善）
+    move: str  # 候補手（PVの初手）
+    score_cp: Optional[int] = None  # centipawn（現局面の手番側視点）
+    score_mate: Optional[int] = None  # 詰み手数
+    pv: list[str] = None  # 読み筋
+
+    def __post_init__(self):
+        if self.pv is None:
+            self.pv = []
+
+
+@dataclass
 class SearchResult:
     """探索結果"""
     bestmove: str
@@ -23,10 +37,13 @@ class SearchResult:
     pv: list[str] = None  # 最善手順
     depth: int = 0
     nodes: int = 0
+    multipv: list[MultiPVEntry] = None  # MultiPV候補（MultiPV>1設定時のみ）
 
     def __post_init__(self):
         if self.pv is None:
             self.pv = []
+        if self.multipv is None:
+            self.multipv = []
 
 
 class USIEngine:
@@ -186,29 +203,59 @@ class USIEngine:
 
         return result
 
+    @staticmethod
+    def _parse_score_pv(line: str) -> tuple[Optional[int], Optional[int], list[str]]:
+        """info行からscore cp/mateとpvを抽出
+
+        Args:
+            line: エンジンのinfo行
+
+        Returns:
+            (score_cp, score_mate, pv)のタプル
+        """
+        score_cp = None
+        score_mate = None
+
+        cp_match = re.search(r"score cp (-?\d+)", line)
+        if cp_match:
+            score_cp = int(cp_match.group(1))
+
+        mate_match = re.search(r"score mate (-?\d+)", line)
+        if mate_match:
+            score_mate = int(mate_match.group(1))
+
+        pv_match = re.search(r" pv (.+)$", line)
+        pv = pv_match.group(1).split() if pv_match else []
+
+        return score_cp, score_mate, pv
+
     def _parse_search_result(self, lines: list[str]) -> SearchResult:
         """探索結果をパース"""
         result = SearchResult(bestmove="resign")
 
         # 最後のinfo行を探す
+        # MultiPV有効時は各順位の最終行を記録し、bestmoveの評価にはmultipv 1を使う
         last_info = None
+        multipv_lines: dict[int, str] = {}
         for line in lines:
             if line.startswith("info") and "score" in line:
-                last_info = line
+                mpv_match = re.search(r"\bmultipv (\d+)\b", line)
+                if mpv_match:
+                    rank = int(mpv_match.group(1))
+                    multipv_lines[rank] = line
+                    if rank == 1:
+                        last_info = line
+                else:
+                    last_info = line
             elif line.startswith("bestmove"):
                 parts = line.split()
                 if len(parts) >= 2:
                     result.bestmove = parts[1]
 
         if last_info:
-            # score cp または score mate を抽出
-            cp_match = re.search(r"score cp (-?\d+)", last_info)
-            if cp_match:
-                result.score_cp = int(cp_match.group(1))
-
-            mate_match = re.search(r"score mate (-?\d+)", last_info)
-            if mate_match:
-                result.score_mate = int(mate_match.group(1))
+            result.score_cp, result.score_mate, result.pv = self._parse_score_pv(
+                last_info
+            )
 
             # depth
             depth_match = re.search(r"depth (\d+)", last_info)
@@ -220,10 +267,19 @@ class USIEngine:
             if nodes_match:
                 result.nodes = int(nodes_match.group(1))
 
-            # pv
-            pv_match = re.search(r" pv (.+)$", last_info)
-            if pv_match:
-                result.pv = pv_match.group(1).split()
+        # MultiPVエントリを構築（順位2以上が存在する場合のみ）
+        if len(multipv_lines) >= 2:
+            for rank in sorted(multipv_lines):
+                score_cp, score_mate, pv = self._parse_score_pv(multipv_lines[rank])
+                if not pv:
+                    continue
+                result.multipv.append(MultiPVEntry(
+                    rank=rank,
+                    move=pv[0],
+                    score_cp=score_cp,
+                    score_mate=score_mate,
+                    pv=pv,
+                ))
 
         return result
 

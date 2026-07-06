@@ -23,7 +23,7 @@ import shogi
 # プロジェクトルートをパスに追加
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shogi_utils.usi_engine import USIEngine, get_engine_path, get_default_engine_path
+from shogi_utils.usi_engine import USIEngine, MultiPVEntry, get_engine_path, get_default_engine_path
 
 
 @dataclass
@@ -34,6 +34,134 @@ class PositionRecord:
     ply: int            # 手数
     game_id: int        # 対局ID
     result: Optional[str] = None  # 対局結果（"black_win", "white_win", "draw"）
+    source: Optional[str] = None  # レコード由来（None=対局局面, "pv_leaf", "multipv"）
+
+
+def record_to_dict(record: PositionRecord | dict) -> dict:
+    """レコードをJSONL書き込み用の辞書に変換（sourceがNoneなら省略）.
+
+    Args:
+        record: PositionRecordまたは辞書
+
+    Returns:
+        書き込み用の辞書
+    """
+    d = asdict(record) if isinstance(record, PositionRecord) else dict(record)
+    if d.get("source") is None:
+        d.pop("source", None)
+    return d
+
+
+def mate_to_cp(score_cp: Optional[int], score_mate: Optional[int]) -> Optional[int]:
+    """cp/mateスコアをcpに統一（mateは±30000に変換）.
+
+    Args:
+        score_cp: centipawnスコア
+        score_mate: 詰み手数
+
+    Returns:
+        centipawnスコア。どちらも無ければNone
+    """
+    if score_cp is not None:
+        return score_cp
+    if score_mate is not None:
+        return 30000 if score_mate > 0 else -30000
+    return None
+
+
+def build_pv_leaf_record(
+    moves: list[str],
+    ply: int,
+    game_id: int,
+    score_cp: int,
+    pv: list[str],
+) -> Optional[PositionRecord]:
+    """PV末端局面のレコードを構築.
+
+    探索評価値は読み筋（PV）末端の静的評価に対応するため、
+    PVを適用した「静止した局面」にラベルを付けることで、
+    1手読みで使う評価関数の学習に適したデータになる。
+
+    Args:
+        moves: 現局面までの指し手リスト
+        ply: 現局面の手数
+        game_id: 対局ID
+        score_cp: 現局面の探索評価値（手番側視点）
+        pv: 読み筋（USI形式）
+
+    Returns:
+        PV末端局面のレコード。PVが空または非合法手を含む場合None
+    """
+    if not pv:
+        return None
+
+    # PVの合法性を検証（エンジンのPVはhash再構築で稀に壊れることがある）
+    board = shogi.Board()
+    for move_usi in moves:
+        board.push_usi(move_usi)
+    for move_usi in pv:
+        try:
+            move = shogi.Move.from_usi(move_usi)
+        except ValueError:
+            return None
+        if move not in board.legal_moves:
+            return None
+        board.push(move)
+
+    # score_cpは現局面の手番側視点。PVが奇数手なら末端局面は相手番なので符号反転
+    leaf_score = score_cp if len(pv) % 2 == 0 else -score_cp
+    sfen = "startpos moves " + " ".join(list(moves) + list(pv))
+
+    return PositionRecord(
+        sfen=sfen,
+        score_cp=leaf_score,
+        ply=ply + len(pv),
+        game_id=game_id,
+        source="pv_leaf",
+    )
+
+
+def build_multipv_records(
+    moves: list[str],
+    ply: int,
+    game_id: int,
+    entries: list[MultiPVEntry],
+) -> list[PositionRecord]:
+    """MultiPV候補手の子局面レコードを構築.
+
+    順位2以下の候補手について、その手を指した後の局面に評価値を付ける。
+    1回の探索から「良い手と悪い手の評価差」を含むデータが得られる。
+    順位1（最善手）の子局面は次の手番の通常探索で記録されるため除外する。
+
+    Args:
+        moves: 現局面までの指し手リスト
+        ply: 現局面の手数
+        game_id: 対局ID
+        entries: MultiPV候補のリスト
+
+    Returns:
+        子局面レコードのリスト
+    """
+    records: list[PositionRecord] = []
+    for entry in entries:
+        if entry.rank <= 1:
+            continue
+
+        score = mate_to_cp(entry.score_cp, entry.score_mate)
+        if score is None:
+            continue
+
+        # entryのscoreは現局面の手番側視点。子局面は相手番なので符号反転
+        sfen = "startpos moves " + " ".join(list(moves) + [entry.move])
+        records.append(PositionRecord(
+            sfen=sfen,
+            score_cp=-score,
+            ply=ply + 1,
+            game_id=game_id,
+            source="multipv",
+        ))
+
+    return records
 
 
 class SelfPlayGenerator:
@@ -50,6 +178,8 @@ class SelfPlayGenerator:
         random_type: str = "full",
         weak_side: Optional[str] = None,
         weak_prob: float = 0.5,
+        record_pv_leaf: bool = False,
+        multipv: int = 1,
     ):
         """
         Args:
@@ -62,6 +192,8 @@ class SelfPlayGenerator:
             random_type: ランダム手の生成方式 ("engine"=go random, "full"=完全ランダム)
             weak_side: 弱い側 ("black", "white", "alternate", None)
             weak_prob: 弱い側がランダム手を指す確率 (0.0〜1.0)
+            record_pv_leaf: PV末端局面のレコードも記録する
+            multipv: MultiPV数（2以上で候補手の子局面レコードも記録）
         """
         self.engine_path = engine_path
         self.depth = depth
@@ -72,6 +204,8 @@ class SelfPlayGenerator:
         self.random_type = random_type
         self.weak_side = weak_side
         self.weak_prob = weak_prob
+        self.record_pv_leaf = record_pv_leaf
+        self.multipv = multipv
 
         # depthとmovetimeのどちらも指定されていない場合はdepth=10をデフォルトに
         if self.depth is None and self.movetime is None:
@@ -137,6 +271,8 @@ class SelfPlayGenerator:
             engine.init_usi()
             engine.set_option("USI_OwnBook", self.use_book)
             engine.set_option("Threads", 1)  # 再現性のため1スレッド
+            if self.multipv > 1:
+                engine.set_option("MultiPV", self.multipv)
             engine.is_ready()
             engine.new_game()
 
@@ -188,13 +324,11 @@ class SelfPlayGenerator:
                     break
 
                 # 評価値を取得（手番側から見た値）
-                score_cp = search_result.score_cp
+                score_cp = mate_to_cp(
+                    search_result.score_cp, search_result.score_mate
+                )
                 if score_cp is None:
-                    if search_result.score_mate is not None:
-                        # 詰みの場合は大きな値に変換
-                        score_cp = 30000 if search_result.score_mate > 0 else -30000
-                    else:
-                        score_cp = 0  # フォールバック
+                    score_cp = 0  # フォールバック
 
                 # SFEN取得のため一時的に局面を設定して'd'コマンドを使う代わりに、
                 # movesから構築したSFENを保存（簡易版）
@@ -207,6 +341,20 @@ class SelfPlayGenerator:
                     ply=ply,
                     game_id=game_id,
                 ))
+
+                # PV末端局面のレコードを追加
+                if self.record_pv_leaf and search_result.pv:
+                    leaf = build_pv_leaf_record(
+                        moves, ply, game_id, score_cp, search_result.pv
+                    )
+                    if leaf is not None:
+                        records.append(leaf)
+
+                # MultiPV候補手の子局面レコードを追加
+                if self.multipv > 1 and search_result.multipv:
+                    records.extend(build_multipv_records(
+                        moves, ply, game_id, search_result.multipv
+                    ))
 
                 # 指し手を追加
                 moves.append(search_result.bestmove)
@@ -245,13 +393,15 @@ def _play_game_worker(args: tuple) -> list[dict]:
 
     Args:
         args: (game_id, engine_path, depth, movetime, max_ply, use_book,
-               random_opening_ply, random_type, weak_side, weak_prob)
+               random_opening_ply, random_type, weak_side, weak_prob,
+               record_pv_leaf, multipv)
 
     Returns:
         局面レコードのリスト（辞書形式）
     """
     (game_id, engine_path, depth, movetime, max_ply, use_book,
-     random_opening_ply, random_type, weak_side, weak_prob) = args
+     random_opening_ply, random_type, weak_side, weak_prob,
+     record_pv_leaf, multipv) = args
 
     generator = SelfPlayGenerator(
         engine_path=Path(engine_path),
@@ -263,11 +413,13 @@ def _play_game_worker(args: tuple) -> list[dict]:
         random_type=random_type,
         weak_side=weak_side,
         weak_prob=weak_prob,
+        record_pv_leaf=record_pv_leaf,
+        multipv=multipv,
     )
 
     try:
         records = generator.play_game(game_id)
-        return [asdict(r) for r in records]
+        return [record_to_dict(r) for r in records]
     except Exception as e:
         print(f"Game {game_id} error: {e}", flush=True)
         return []
@@ -286,6 +438,8 @@ def generate_dataset_parallel(
     num_workers: int = 4,
     weak_side: Optional[str] = None,
     weak_prob: float = 0.5,
+    record_pv_leaf: bool = False,
+    multipv: int = 1,
 ) -> int:
     """データセットを並列生成
 
@@ -302,6 +456,8 @@ def generate_dataset_parallel(
         num_workers: ワーカー数
         weak_side: 弱い側 ("black", "white", "alternate", None)
         weak_prob: 弱い側がランダム手を指す確率
+        record_pv_leaf: PV末端局面のレコードも記録する
+        multipv: MultiPV数（2以上で候補手の子局面レコードも記録）
 
     Returns:
         生成した局面数
@@ -311,7 +467,8 @@ def generate_dataset_parallel(
     # ワーカーへの引数を準備
     worker_args = [
         (game_id, str(engine_path), depth, movetime, max_ply, use_book,
-         random_opening_ply, random_type, weak_side, weak_prob)
+         random_opening_ply, random_type, weak_side, weak_prob,
+         record_pv_leaf, multipv)
         for game_id in range(num_games)
     ]
 
@@ -354,6 +511,8 @@ def generate_dataset(
     random_type: str = "full",
     weak_side: Optional[str] = None,
     weak_prob: float = 0.5,
+    record_pv_leaf: bool = False,
+    multipv: int = 1,
 ) -> int:
     """データセットを生成
 
@@ -369,6 +528,8 @@ def generate_dataset(
         random_type: ランダム手の生成方式 ("engine" or "full")
         weak_side: 弱い側 ("black", "white", "alternate", None)
         weak_prob: 弱い側がランダム手を指す確率
+        record_pv_leaf: PV末端局面のレコードも記録する
+        multipv: MultiPV数（2以上で候補手の子局面レコードも記録）
 
     Returns:
         生成した局面数
@@ -383,6 +544,8 @@ def generate_dataset(
         random_type=random_type,
         weak_side=weak_side,
         weak_prob=weak_prob,
+        record_pv_leaf=record_pv_leaf,
+        multipv=multipv,
     )
 
     total_positions = 0
@@ -396,7 +559,7 @@ def generate_dataset(
             try:
                 records = generator.play_game(game_id)
                 for record in records:
-                    f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+                    f.write(json.dumps(record_to_dict(record), ensure_ascii=False) + "\n")
 
                 total_positions += len(records)
                 print(f"{len(records)} positions, result: {records[0].result if records else 'N/A'}")
@@ -426,6 +589,10 @@ def main():
                         help="弱い側 (black=先手, white=後手, alternate=交互, both=両方)")
     parser.add_argument("--weak-prob", type=float, default=0.5,
                         help="弱い側がランダム手を指す確率 (0.0-1.0, デフォルト: 0.5)")
+    parser.add_argument("--record-pv-leaf", action="store_true",
+                        help="PV末端局面（静止局面）のレコードも記録")
+    parser.add_argument("--multipv", type=int, default=1,
+                        help="MultiPV数（2以上で候補手の子局面レコードも記録、デフォルト: 1）")
 
     args = parser.parse_args()
 
@@ -463,6 +630,10 @@ def main():
     print(f"  Workers: {args.workers}")
     if args.weak_side:
         print(f"  Weak side: {args.weak_side} (prob={args.weak_prob})")
+    if args.record_pv_leaf:
+        print(f"  Record PV leaf: enabled")
+    if args.multipv > 1:
+        print(f"  MultiPV: {args.multipv}")
     print(f"  Output: {output_path}")
     print()
 
@@ -480,6 +651,8 @@ def main():
             num_workers=args.workers,
             weak_side=args.weak_side,
             weak_prob=args.weak_prob,
+            record_pv_leaf=args.record_pv_leaf,
+            multipv=args.multipv,
         )
     else:
         total = generate_dataset(
@@ -494,6 +667,8 @@ def main():
             random_type=args.random_type,
             weak_side=args.weak_side,
             weak_prob=args.weak_prob,
+            record_pv_leaf=args.record_pv_leaf,
+            multipv=args.multipv,
         )
 
     print(f"\nDone! Total positions: {total}")
