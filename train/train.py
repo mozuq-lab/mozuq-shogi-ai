@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader, Subset, random_split
 
 from models import ShogiValueDataset, ValueTransformer, collate_fn
@@ -102,6 +103,10 @@ class TrainConfig:
     # 過去にnormalize_turnのラベル符号バグで出力が定数に崩壊する問題があり、
     # その対症療法として導入された。バグ修正済みのため通常は不要。
     variance_reg_weight: float = 0.0
+
+    # EMA (Exponential Moving Average)
+    # 0で無効。有効時（推奨: 0.999）はvalidateとbest.pt保存にEMA重みを使用
+    ema_decay: float = 0.0
 
 
 @dataclass
@@ -200,15 +205,25 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     config: TrainConfig,
     state: TrainState,
+    ema_model: AveragedModel | None = None,
 ) -> None:
-    """チェックポイントを保存."""
+    """チェックポイントを保存.
+
+    EMA有効時はmodel_state_dictにEMA重み（推論用）を、
+    raw_model_state_dictに生の重み（学習再開用）を保存する。
+    """
     checkpoint = {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": (
+            ema_model.module.state_dict() if ema_model is not None
+            else model.state_dict()
+        ),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "config": vars(config),
         "state": vars(state),
     }
+    if ema_model is not None:
+        checkpoint["raw_model_state_dict"] = model.state_dict()
     torch.save(checkpoint, path)
     logger.info(f"Checkpoint saved: {path}")
 
@@ -218,10 +233,21 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    ema_model: AveragedModel | None = None,
 ) -> tuple[TrainConfig, TrainState]:
-    """チェックポイントを読み込み."""
+    """チェックポイントを読み込み.
+
+    EMA付きcheckpointの場合、modelには生の重み（raw_model_state_dict）、
+    ema_modelにはEMA重み（model_state_dict）を復元する。
+    """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    raw_state_dict = checkpoint.get(
+        "raw_model_state_dict", checkpoint["model_state_dict"]
+    )
+    model.load_state_dict(raw_state_dict)
+
+    if ema_model is not None:
+        ema_model.module.load_state_dict(checkpoint["model_state_dict"])
 
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -248,6 +274,7 @@ def train_epoch(
     grad_clip_norm: float = 1.0,
     label_smoothing: float = 0.05,
     variance_reg_weight: float = 0.1,
+    ema_model: AveragedModel | None = None,
 ) -> float:
     """1エポック学習."""
     model.train()
@@ -307,6 +334,10 @@ def train_epoch(
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
         optimizer.step()
+
+        # EMA更新
+        if ema_model is not None:
+            ema_model.update_parameters(model)
 
         total_loss += loss.item()
         num_batches += 1
@@ -418,6 +449,14 @@ def train(config: TrainConfig) -> None:
     ).to(device)
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # EMAモデル
+    ema_model: AveragedModel | None = None
+    if config.ema_decay > 0:
+        ema_model = AveragedModel(
+            model, multi_avg_fn=get_ema_multi_avg_fn(config.ema_decay)
+        )
+        logger.info(f"EMA enabled: decay={config.ema_decay}")
+
     # オプティマイザ・スケジューラ
     optimizer = AdamW(
         model.parameters(),
@@ -437,7 +476,9 @@ def train(config: TrainConfig) -> None:
     if config.resume:
         resume_path = Path(config.resume)
         if resume_path.exists():
-            _, state = load_checkpoint(resume_path, model, optimizer, scheduler)
+            _, state = load_checkpoint(
+                resume_path, model, optimizer, scheduler, ema_model
+            )
 
     # 出力ディレクトリ
     output_dir = Path(config.output_dir)
@@ -469,12 +510,14 @@ def train(config: TrainConfig) -> None:
             grad_clip_norm=config.grad_clip_norm,
             label_smoothing=config.label_smoothing,
             variance_reg_weight=config.variance_reg_weight,
+            ema_model=ema_model,
         )
         state.train_losses.append(train_loss)
 
-        # バリデーション
+        # バリデーション（EMA有効時はEMA重みで評価）
+        eval_model = ema_model.module if ema_model is not None else model
         val_loss = validate(
-            model, val_loader, device,
+            eval_model, val_loader, device,
             use_features=config.use_features,
             aux_loss_weight=config.aux_loss_weight,
         )
@@ -498,6 +541,7 @@ def train(config: TrainConfig) -> None:
             save_checkpoint(
                 output_dir / "best.pt",
                 model, optimizer, scheduler, config, state,
+                ema_model=ema_model,
             )
 
         # 定期保存
@@ -505,6 +549,7 @@ def train(config: TrainConfig) -> None:
             save_checkpoint(
                 output_dir / f"epoch_{epoch + 1:04d}.pt",
                 model, optimizer, scheduler, config, state,
+                ema_model=ema_model,
             )
 
         # ログ保存
@@ -523,6 +568,7 @@ def train(config: TrainConfig) -> None:
     save_checkpoint(
         output_dir / "final.pt",
         model, optimizer, scheduler, config, state,
+        ema_model=ema_model,
     )
 
 
@@ -577,6 +623,9 @@ def main() -> None:
     # 分散正則化（通常は不要。過去のラベル符号バグの対症療法として存在）
     parser.add_argument("--variance-reg-weight", type=float, default=0.0, help="分散正則化の重み（デフォルト: 0=無効）")
 
+    # EMA
+    parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA減衰率（0=無効、推奨: 0.999）")
+
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -609,6 +658,7 @@ def main() -> None:
         augment_flip=args.augment_flip,
         num_workers=args.num_workers,
         variance_reg_weight=args.variance_reg_weight,
+        ema_decay=args.ema_decay,
     )
 
     train(config)
