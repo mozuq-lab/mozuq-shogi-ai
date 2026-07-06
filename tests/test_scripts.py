@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import shogi
 
 from scripts.move_agreement import (
@@ -9,6 +11,7 @@ from scripts.move_agreement import (
     engine_position_args,
     summarize,
 )
+from scripts.selfplay_match import elo_diff, play_game, random_opening
 
 
 class TestBoardFromSfenLine:
@@ -82,3 +85,72 @@ class TestSummarize:
         assert summary["middlegame"]["matched"] == 2
         assert summary["endgame"]["total"] == 2
         assert summary["endgame"]["agreement"] == 0.5
+
+
+def _random_move_fn(rng: random.Random):
+    """ランダムに合法手を選ぶMoveFn（テスト用）."""
+
+    def fn(board: shogi.Board) -> tuple[str, int]:
+        legal = list(board.legal_moves)
+        return rng.choice(legal).usi(), 0
+
+    return fn
+
+
+class TestPlayGame:
+    """play_gameのテスト."""
+
+    def test_max_moves_draw(self) -> None:
+        """最大手数に達したら引き分けになる."""
+        rng = random.Random(0)
+        result = play_game(
+            shogi.Board(), _random_move_fn(rng), _random_move_fn(rng), max_moves=10
+        )
+        assert result == "draw"
+
+    def test_random_game_terminates(self) -> None:
+        """ランダム同士の対局が正常な結果で終了する."""
+        rng = random.Random(1)
+        result = play_game(
+            shogi.Board(), _random_move_fn(rng), _random_move_fn(rng), max_moves=512
+        )
+        assert result in ("black_win", "white_win", "draw")
+
+    def test_resign_black(self) -> None:
+        """先手が投了したら後手勝ち."""
+
+        def resign_fn(board: shogi.Board) -> tuple[str, int]:
+            return "resign", -30000
+
+        rng = random.Random(2)
+        result = play_game(
+            shogi.Board(), resign_fn, _random_move_fn(rng), max_moves=10
+        )
+        assert result == "white_win"
+
+
+class TestRandomOpening:
+    """random_openingのテスト."""
+
+    def test_moves_applied(self) -> None:
+        rng = random.Random(42)
+        board = random_opening(rng, 8)
+        assert board.move_number == 9  # 8手進んだ局面
+
+    def test_deterministic(self) -> None:
+        board1 = random_opening(random.Random(42), 8)
+        board2 = random_opening(random.Random(42), 8)
+        assert board1.sfen() == board2.sfen()
+
+
+class TestEloDiff:
+    """elo_diffのテスト."""
+
+    def test_even(self) -> None:
+        assert elo_diff(0.5) == 0.0
+
+    def test_positive(self) -> None:
+        assert 180 < elo_diff(0.75) < 200  # 勝率75% ≈ +191
+
+    def test_symmetric(self) -> None:
+        assert abs(elo_diff(0.6) + elo_diff(0.4)) < 1e-9
