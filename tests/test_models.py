@@ -219,6 +219,90 @@ class TestValueTransformer:
                 assert param.grad is not None, f"No gradient for {name}"
 
 
+class TestModelStructureOptions:
+    """モデル構造オプション（玉相対・2D位置・持ち駒離散）のテスト."""
+
+    @pytest.fixture
+    def batch(self) -> dict[str, torch.Tensor]:
+        parsed = parse_sfen("startpos moves 7g7f 3c3d")
+        board = parsed.board.unsqueeze(0)
+        hand = parsed.hand.unsqueeze(0)
+        turn = parsed.turn.unsqueeze(0)
+        return {"board": board, "hand": hand, "turn": turn}
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            {"use_king_relative": True},
+            {"use_2d_pos": True},
+            {"use_discrete_hand": True},
+            {"use_king_relative": True, "use_2d_pos": True, "use_discrete_hand": True},
+        ],
+    )
+    def test_forward_and_gradient(
+        self, batch: dict[str, torch.Tensor], flags: dict[str, bool]
+    ) -> None:
+        """各フラグでforwardと勾配伝播が動作する."""
+        model = ValueTransformer(
+            d_model=32, n_heads=2, n_layers=1, ffn_dim=64, dropout=0.0, **flags
+        )
+        value, outcome = model(batch["board"], batch["hand"], batch["turn"])
+        assert value.shape == (1, 1)
+        assert outcome.shape == (1, 1)
+
+        (value.sum() + outcome.sum()).backward()
+        for name, param in model.named_parameters():
+            assert param.grad is not None, f"No gradient for {name}"
+
+    def test_backward_compatible_state_dict(self) -> None:
+        """フラグ無効時のstate_dictキーが従来と同じ（旧checkpoint互換）."""
+        model = ValueTransformer(d_model=32, n_heads=2, n_layers=1, ffn_dim=64)
+        keys = set(model.state_dict().keys())
+        # 新規パラメータはフラグ無効時に存在しない
+        assert not any("king_rel" in k for k in keys)
+        assert not any("rank_embedding" in k for k in keys)
+        assert not any("file_embedding" in k for k in keys)
+        assert not any("hand_count_embedding" in k for k in keys)
+        # 定数バッファはstate_dictに含まれない（persistent=False）
+        assert "square_rows" not in keys
+        assert "square_cols" not in keys
+
+    def test_king_relative_index_of_king_square(self) -> None:
+        """玉のマス自身の相対インデックスは中心(8,8)=144になる."""
+        model = ValueTransformer(
+            d_model=32, n_heads=2, n_layers=1, ffn_dim=64, use_king_relative=True
+        )
+        parsed = parse_sfen("startpos")
+        board = parsed.board.unsqueeze(0)
+
+        # 先手玉は5i = idx 76
+        king_idx = 76
+        king_row, king_col = king_idx // 9, king_idx % 9
+        dr = model.square_rows[king_idx] - king_row + 8
+        dc = model.square_cols[king_idx] - king_col + 8
+        assert (dr * 17 + dc).item() == 144
+
+        # 埋め込みが玉不在でゼロ、存在で非ゼロになることも確認
+        emb = model._king_relative_embedding(board)
+        assert emb.shape == (1, 81, 32)
+        assert emb.abs().sum().item() > 0
+
+        empty_board = torch.zeros(1, 81, dtype=torch.long)
+        emb_empty = model._king_relative_embedding(empty_board)
+        assert emb_empty.abs().sum().item() == 0.0
+
+    def test_discrete_hand_clamps_count(self) -> None:
+        """持ち駒19枚以上でもクランプされて動作する."""
+        model = ValueTransformer(
+            d_model=32, n_heads=2, n_layers=1, ffn_dim=64, use_discrete_hand=True
+        )
+        board = torch.zeros(1, 81, dtype=torch.long)
+        hand = torch.full((1, 14), 25, dtype=torch.long)  # 範囲外の枚数
+        turn = torch.zeros(1, dtype=torch.long)
+        value, _ = model(board, hand, turn)
+        assert value.shape == (1, 1)
+
+
 class TestShogiValueDataset:
     """データセットのテスト."""
 

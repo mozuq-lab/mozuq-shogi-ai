@@ -80,6 +80,11 @@ class TrainConfig:
     # Pooling方式
     use_attention_pooling: bool = True
 
+    # モデル構造オプション
+    use_king_relative: bool = False
+    use_2d_pos: bool = False
+    use_discrete_hand: bool = False
+
     # 勝敗補助損失
     aux_loss_weight: float = 0.1
 
@@ -492,6 +497,9 @@ def train(config: TrainConfig) -> None:
         dropout=config.dropout,
         use_features=config.use_features,
         use_attention_pooling=config.use_attention_pooling,
+        use_king_relative=config.use_king_relative,
+        use_2d_pos=config.use_2d_pos,
+        use_discrete_hand=config.use_discrete_hand,
     ).to(device)
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -649,6 +657,11 @@ def main() -> None:
     # Pooling方式
     parser.add_argument("--no-attention-pooling", action="store_true", help="Mean Poolingを使用（デフォルトはAttention Pooling）")
 
+    # モデル構造オプション
+    parser.add_argument("--use-king-relative", action="store_true", help="玉相対位置埋め込みを使用")
+    parser.add_argument("--use-2d-pos", action="store_true", help="2D位置埋め込み（段・筋）を使用")
+    parser.add_argument("--use-discrete-hand", action="store_true", help="持ち駒枚数を離散埋め込みで扱う")
+
     # 補助損失
     parser.add_argument("--aux-loss-weight", type=float, default=0.1, help="勝敗補助損失の重み")
 
@@ -706,6 +719,9 @@ def main() -> None:
         dropout=args.dropout,
         use_features=args.use_features,
         use_attention_pooling=not args.no_attention_pooling,
+        use_king_relative=args.use_king_relative,
+        use_2d_pos=args.use_2d_pos,
+        use_discrete_hand=args.use_discrete_hand,
         aux_loss_weight=args.aux_loss_weight,
         warmup_epochs=args.warmup_epochs,
         grad_clip_norm=args.grad_clip_norm,

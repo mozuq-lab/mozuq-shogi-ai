@@ -90,6 +90,9 @@ class Evaluator:
             dropout=0.0,  # 推論時はドロップアウト無効
             use_features=use_features,
             use_attention_pooling=use_attention_pooling,
+            use_king_relative=config.get("use_king_relative", False),
+            use_2d_pos=config.get("use_2d_pos", False),
+            use_discrete_hand=config.get("use_discrete_hand", False),
         )
 
         model.load_state_dict(state_dict)
