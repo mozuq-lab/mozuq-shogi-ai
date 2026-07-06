@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from models import ShogiValueDataset, ValueTransformer, collate_fn
 
@@ -89,6 +89,7 @@ class TrainConfig:
     # データ前処理
     cp_noise: float = 0.0
     cp_filter_threshold: float | None = None
+    drop_zero_cp: bool = False
 
     # データ拡張
     normalize_turn: bool = False
@@ -97,8 +98,10 @@ class TrainConfig:
     # データローダー
     num_workers: int = 0
 
-    # 分散正則化（出力が定数に崩壊するのを防ぐ）
-    variance_reg_weight: float = 0.1
+    # 分散正則化（デフォルト無効）
+    # 過去にnormalize_turnのラベル符号バグで出力が定数に崩壊する問題があり、
+    # その対症療法として導入された。バグ修正済みのため通常は不要。
+    variance_reg_weight: float = 0.0
 
 
 @dataclass
@@ -110,6 +113,72 @@ class TrainState:
     best_val_loss: float = float("inf")
     train_losses: list[float] = field(default_factory=list)
     val_losses: list[float] = field(default_factory=list)
+
+
+def split_by_game(
+    dataset: ShogiValueDataset,
+    val_split: float,
+    seed: int = 42,
+) -> tuple[Subset, Subset]:
+    """対局（game_id）単位で訓練/検証データを分割.
+
+    同一対局内の局面は強く相関するため、ランダム分割では
+    train/valに近傍局面が跨りval_lossが楽観的になる。
+    game_id単位で分割することでリークを防ぐ。
+
+    augment_flip有効時は、反転版サンプル（インデックス後半）も
+    元サンプルと同じ側に割り当てる。
+
+    Args:
+        dataset: 分割対象のデータセット
+        val_split: 検証データの割合
+        seed: シャッフル用シード
+
+    Returns:
+        (訓練Subset, 検証Subset)
+    """
+    game_ids = [s.get("game_id", 0) for s in dataset.samples]
+    unique_games = sorted(set(game_ids))
+
+    if len(unique_games) < 2:
+        # game_idが無い/1対局のみの場合はランダム分割にフォールバック
+        logger.warning(
+            "game_idが不足しているためランダム分割にフォールバックします"
+        )
+        val_size = int(len(dataset) * val_split)
+        train_size = len(dataset) - val_size
+        train_subset, val_subset = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(seed),
+        )
+        return train_subset, val_subset
+
+    # 対局単位でシャッフルして分割
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(unique_games), generator=generator).tolist()
+    n_val_games = max(1, int(len(unique_games) * val_split))
+    val_games = {unique_games[i] for i in perm[:n_val_games]}
+
+    base_len = len(dataset.samples)
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    for idx, gid in enumerate(game_ids):
+        if gid in val_games:
+            val_indices.append(idx)
+        else:
+            train_indices.append(idx)
+
+    # augment_flip有効時: 反転版（idx + base_len）も同じ側に割り当てる
+    if dataset.augment_flip:
+        train_indices += [idx + base_len for idx in train_indices]
+        val_indices += [idx + base_len for idx in val_indices]
+
+    logger.info(
+        f"Game-level split: {len(unique_games) - n_val_games} games (train) / "
+        f"{n_val_games} games (val)"
+    )
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 
 def get_device(device_str: str) -> torch.device:
@@ -309,18 +378,13 @@ def train(config: TrainConfig) -> None:
         cp_filter_threshold=config.cp_filter_threshold,
         normalize_turn=config.normalize_turn,
         augment_flip=config.augment_flip,
+        drop_zero_cp=config.drop_zero_cp,
     )
     logger.info(f"Dataset size: {len(dataset)}")
 
-    # 訓練/検証分割
-    val_size = int(len(dataset) * config.val_split)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-    logger.info(f"Train: {train_size}, Val: {val_size}")
+    # 訓練/検証分割（対局単位でリークを防ぐ）
+    train_dataset, val_dataset = split_by_game(dataset, config.val_split)
+    logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     # データローダー
     train_loader = DataLoader(
@@ -501,6 +565,7 @@ def main() -> None:
     parser.add_argument("--cp-scale", type=float, default=1200.0, help="評価値正規化のスケール（デフォルト: 1200）")
     parser.add_argument("--cp-noise", type=float, default=0.0, help="評価値ノイズの標準偏差（cp）")
     parser.add_argument("--cp-filter-threshold", type=float, default=None, help="評価値フィルタの閾値（cp）")
+    parser.add_argument("--drop-zero-cp", action="store_true", help="score_cp==0の局面を除外（旧方式データのダミーラベル対策）")
 
     # データ拡張
     parser.add_argument("--normalize-turn", action="store_true", help="後手番を先手視点に正規化")
@@ -509,8 +574,8 @@ def main() -> None:
     # データローダー
     parser.add_argument("--num-workers", type=int, default=0, help="データローダーのワーカー数")
 
-    # 分散正則化
-    parser.add_argument("--variance-reg-weight", type=float, default=0.1, help="分散正則化の重み")
+    # 分散正則化（通常は不要。過去のラベル符号バグの対症療法として存在）
+    parser.add_argument("--variance-reg-weight", type=float, default=0.0, help="分散正則化の重み（デフォルト: 0=無効）")
 
     args = parser.parse_args()
 
@@ -539,6 +604,7 @@ def main() -> None:
         cp_scale=args.cp_scale,
         cp_noise=args.cp_noise,
         cp_filter_threshold=args.cp_filter_threshold,
+        drop_zero_cp=args.drop_zero_cp,
         normalize_turn=args.normalize_turn,
         augment_flip=args.augment_flip,
         num_workers=args.num_workers,

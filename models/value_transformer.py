@@ -269,7 +269,7 @@ class ValueTransformer(nn.Module):
         return value, outcome
 
 
-def normalize_cp(cp: int, scale: float = 500.0) -> float:
+def normalize_cp(cp: int, scale: float = 1200.0) -> float:
     """centipawnを[-1, 1]に正規化.
 
     Args:
@@ -282,7 +282,7 @@ def normalize_cp(cp: int, scale: float = 500.0) -> float:
     return math.tanh(cp / scale)
 
 
-def denormalize_cp(value: float, scale: float = 500.0) -> float:
+def denormalize_cp(value: float, scale: float = 1200.0) -> float:
     """[-1, 1]をcentipawnに戻す.
 
     Args:

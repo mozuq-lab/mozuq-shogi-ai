@@ -129,6 +129,10 @@ python tools/gen_dataset.py -n 100 --weak-side alternate --weak-prob 0.3 --worke
 | engine | `go random` | なし（0になる） | エンジン内蔵のランダム、高速 |
 | full | 通常探索後に手を差し替え | あり | 全ての局面で評価値を記録 |
 
+※ `engine`方式で生成した既存データはランダム手の局面に評価値0のダミーラベルが
+記録されている（学習に有害）。学習時に`--drop-zero-cp`で除外するか、
+`--random-type full`でデータを再生成すること。
+
 **動作の違い：**
 
 - `--weak-side`なし: 両側とも`--random-opening`手数だけランダム、以降は通常探索
@@ -288,10 +292,13 @@ PYTHONPATH=. python train/train.py \
     --augment-flip \
     --cp-noise 7.5 \
     --cp-filter-threshold 1500 \
+    --drop-zero-cp \
     --num-workers 4 \
     --epochs 100 \
     --batch-size 512
 ```
+
+※ `--drop-zero-cp` は旧方式（`--random-type engine`）で生成したデータを使う場合のみ必要。
 
 #### 出力
 
@@ -341,9 +348,12 @@ PYTHONPATH=. python train/train.py \
 | `--device` | auto | デバイス（auto/cuda/mps/cpu） |
 | `--output-dir` | checkpoints | 出力ディレクトリ |
 | `--resume` | - | 再開するチェックポイント |
-| `--val-split` | 0.1 | 検証データ割合 |
+| `--val-split` | 0.1 | 検証データ割合（対局単位で分割） |
 | `--use-features` | - | 拡張特徴量を使用 |
 | `--aux-loss-weight` | 0.1 | 勝敗補助損失の重み |
+| `--drop-zero-cp` | - | score_cp==0の局面を除外（旧方式データのダミーラベル対策） |
+| `--cp-scale` | 1200 | 評価値正規化のスケール |
+| `--variance-reg-weight` | 0 | 分散正則化の重み（通常は不要） |
 
 #### 出力ファイル
 
@@ -358,7 +368,7 @@ checkpoints/
 ### ハイパーパラメータ
 
 - データセット: 10万〜100万局面
-- 訓練:バリデーション = 9:1
+- 訓練:バリデーション = 9:1（対局単位で分割し、同一対局の局面がtrain/valに跨るリークを防止）
 - Optimizer: AdamW
 - 学習率: 3e-4（5エポックwarmup後、コサインアニーリング）
 - バッチサイズ: 512〜1024

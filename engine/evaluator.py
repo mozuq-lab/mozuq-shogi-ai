@@ -15,7 +15,7 @@ from models import ValueTransformer, denormalize_cp, parse_sfen, compute_all_fea
 from models.dataset import normalize_to_black_view
 
 if TYPE_CHECKING:
-    pass
+    from models.sfen_parser import ParsedPosition
 
 
 class Evaluator:
@@ -33,9 +33,12 @@ class Evaluator:
             device: 推論デバイス（auto/cuda/mps/cpu）
         """
         self.device = self._get_device(device)
-        self.model, self.use_features, self.normalize_turn = self._load_model(
-            Path(model_path)
-        )
+        (
+            self.model,
+            self.use_features,
+            self.normalize_turn,
+            self.cp_scale,
+        ) = self._load_model(Path(model_path))
 
     def _get_device(self, device_str: str) -> torch.device:
         """デバイスを取得."""
@@ -48,7 +51,9 @@ class Evaluator:
                 return torch.device("cpu")
         return torch.device(device_str)
 
-    def _load_model(self, model_path: Path) -> tuple[ValueTransformer, bool, bool]:
+    def _load_model(
+        self, model_path: Path
+    ) -> tuple[ValueTransformer, bool, bool, float]:
         """モデルを読み込み."""
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
@@ -56,6 +61,15 @@ class Evaluator:
         config = checkpoint.get("config", {})
         use_features = config.get("use_features", False)
         normalize_turn = config.get("normalize_turn", False)
+        # 学習時の正規化スケール（denormalizeに同じ値を使わないと評価値が歪む）
+        cp_scale = config.get("cp_scale", 500.0)
+
+        # Attention Pooling導入前のcheckpointはconfigにキーが無いため、
+        # state_dictの実際のキーから判定する
+        state_dict = checkpoint["model_state_dict"]
+        use_attention_pooling = config.get(
+            "use_attention_pooling", "pool_query" in state_dict
+        )
 
         model = ValueTransformer(
             d_model=config.get("d_model", 256),
@@ -64,13 +78,87 @@ class Evaluator:
             ffn_dim=config.get("ffn_dim", 512),
             dropout=0.0,  # 推論時はドロップアウト無効
             use_features=use_features,
+            use_attention_pooling=use_attention_pooling,
         )
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(state_dict)
         model.to(self.device)
         model.eval()
 
-        return model, use_features, normalize_turn
+        return model, use_features, normalize_turn, cp_scale
+
+    def _prepare_single(
+        self, parsed: ParsedPosition
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """1局面分のモデル入力テンソルを作成（CPU上、バッチ次元なし）.
+
+        normalize_turnで学習したモデルの場合、後手番局面を先手視点に変換する。
+        モデル出力は変換後の盤面の手番側（=元の手番側）視点なので、
+        呼び出し側での符号反転は不要。
+
+        Args:
+            parsed: パース済み局面
+
+        Returns:
+            (board, hand, turn, features)のタプル。featuresは
+            use_features=Falseの場合None。
+        """
+        board = parsed.board
+        hand = parsed.hand
+        turn = parsed.turn
+
+        if self.normalize_turn and turn.item() == 1:
+            # ダミーの評価値と勝敗を渡して盤面のみ正規化
+            board, hand, turn, _, _ = normalize_to_black_view(
+                board, hand, turn, 0.0, 0.5
+            )
+
+        features: torch.Tensor | None = None
+        if self.use_features:
+            feat_dict = compute_all_features(board)
+            features = torch.cat([
+                feat_dict["attack_map"],
+                feat_dict["king_distance"],
+                feat_dict["piece_value"].unsqueeze(1),
+                feat_dict["control"].unsqueeze(1),
+                feat_dict["king_safety"],
+            ], dim=1)
+
+        return board, hand, turn, features
+
+    def _evaluate_batch(self, parsed_list: list[ParsedPosition]) -> torch.Tensor:
+        """複数局面をまとめて評価.
+
+        Args:
+            parsed_list: パース済み局面のリスト
+
+        Returns:
+            各局面の評価値テンソル (N,) - [-1, 1]、手番側視点
+        """
+        boards: list[torch.Tensor] = []
+        hands: list[torch.Tensor] = []
+        turns: list[torch.Tensor] = []
+        features_list: list[torch.Tensor] = []
+
+        for parsed in parsed_list:
+            board, hand, turn, features = self._prepare_single(parsed)
+            boards.append(board)
+            hands.append(hand)
+            turns.append(turn)
+            if features is not None:
+                features_list.append(features)
+
+        batch_board = torch.stack(boards).to(self.device)
+        batch_hand = torch.stack(hands).to(self.device)
+        batch_turn = torch.stack(turns).to(self.device)
+        batch_features = (
+            torch.stack(features_list).to(self.device) if features_list else None
+        )
+
+        with torch.no_grad():
+            value, _ = self.model(batch_board, batch_hand, batch_turn, batch_features)
+
+        return value.squeeze(1).cpu()
 
     def evaluate_sfen(self, sfen: str) -> int:
         """SFEN文字列で表された局面を評価.
@@ -81,49 +169,9 @@ class Evaluator:
         Returns:
             評価値（centipawn、手番側視点）
         """
-        # SFENをパース
         parsed = parse_sfen(sfen)
-
-        board = parsed.board
-        hand = parsed.hand
-        turn = parsed.turn
-
-        # normalize_turnで学習したモデルの場合、後手番を先手視点に変換
-        is_white_turn = turn.item() == 1
-        if self.normalize_turn and is_white_turn:
-            # ダミーの評価値と勝敗を渡して正規化
-            board, hand, turn, _, _ = normalize_to_black_view(
-                board, hand, turn, 0.0, 0.5
-            )
-
-        # バッチ次元を追加
-        board = board.unsqueeze(0).to(self.device)
-        hand = hand.unsqueeze(0).to(self.device)
-        turn = turn.unsqueeze(0).to(self.device)
-
-        # 拡張特徴量
-        features = None
-        if self.use_features:
-            feat_dict = compute_all_features(board.squeeze(0))
-            features = torch.cat([
-                feat_dict["attack_map"],
-                feat_dict["king_distance"],
-                feat_dict["piece_value"].unsqueeze(1),
-                feat_dict["control"].unsqueeze(1),
-                feat_dict["king_safety"],
-            ], dim=1).unsqueeze(0).to(self.device)
-
-        # 推論
-        with torch.no_grad():
-            value_output, _ = self.model(board, hand, turn, features)
-            value = value_output.item()
-
-        # normalize_turnで後手番を変換した場合、評価値を反転して手番側視点に戻す
-        if self.normalize_turn and is_white_turn:
-            value = -value
-
-        # centipawnに変換
-        return int(denormalize_cp(value))
+        value = self._evaluate_batch([parsed])[0].item()
+        return int(denormalize_cp(value, self.cp_scale))
 
     def evaluate_board(self, board: shogi.Board) -> int:
         """python-shogiのBoardオブジェクトを評価.
@@ -139,11 +187,11 @@ class Evaluator:
 
     def _board_to_sfen(self, board: shogi.Board) -> str:
         """BoardオブジェクトをSFEN文字列に変換."""
-        # python-shogiのsfen()は"sfen ..."形式を返す
+        # python-shogiのsfen()は"<board> <turn> <hand> <move_count>"形式を返す
         return "sfen " + board.sfen()
 
     def find_best_move(self, board: shogi.Board) -> tuple[str, int]:
-        """最善手を探索（1手読み）.
+        """最善手を探索（1手読み、全候補を1バッチで評価）.
 
         Args:
             board: 現在の局面
@@ -156,21 +204,18 @@ class Evaluator:
         if not legal_moves:
             return "resign", -30000
 
-        best_move = None
-        best_score = -100000
-
+        # 各合法手を適用した局面をパース
+        parsed_list: list[ParsedPosition] = []
         for move in legal_moves:
-            # 手を適用
             board.push(move)
-
-            # 相手視点の評価値を取得して符号反転
-            score = -self.evaluate_board(board)
-
-            # 手を戻す
+            parsed_list.append(parse_sfen(self._board_to_sfen(board)))
             board.pop()
 
-            if score > best_score:
-                best_score = score
-                best_move = move
+        # 1バッチでまとめて評価
+        # 指した後の局面は相手番なので、符号反転して自分視点に変換
+        values = -self._evaluate_batch(parsed_list)
 
-        return best_move.usi(), best_score
+        best_idx = int(torch.argmax(values).item())
+        best_score = int(denormalize_cp(values[best_idx].item(), self.cp_scale))
+
+        return legal_moves[best_idx].usi(), best_score

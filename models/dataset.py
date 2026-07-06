@@ -101,15 +101,15 @@ def normalize_to_black_view(
     - 盤面を180度回転（上下左右反転）
     - 駒の先後を入れ替え
     - 持ち駒の先後を入れ替え
-    - 評価値の符号を反転
-    - 勝敗の符号を反転
+    - 評価値・勝敗は「手番側視点」のラベルなので変更しない
+      （先後入替後は新しい先手＝元の手番側であり、視点が一致するため）
 
     Args:
         board: 盤面テンソル (81,)
         hand: 持ち駒テンソル (14,)
         turn: 手番テンソル ()
-        value: 正規化評価値
-        outcome: 勝敗ラベル
+        value: 正規化評価値（手番側視点）
+        outcome: 勝敗ラベル（手番側視点）
 
     Returns:
         正規化された (board, hand, turn, value, outcome)
@@ -127,11 +127,8 @@ def normalize_to_black_view(
     flipped_hand = flip_hand(hand)
     # 手番を先手に
     new_turn = torch.tensor(0, dtype=torch.long)
-    # 評価値と勝敗を反転
-    new_value = -value
-    new_outcome = 1.0 - outcome
 
-    return flipped_board, flipped_hand, new_turn, new_value, new_outcome
+    return flipped_board, flipped_hand, new_turn, value, outcome
 
 
 def augment_horizontal_flip(
@@ -165,17 +162,21 @@ class ShogiValueDataset(Dataset):
         cp_filter_threshold: 評価値フィルタの閾値（デフォルト: None、無効）
         normalize_turn: 後手番を先手視点に正規化（デフォルト: False）
         augment_flip: 左右反転でデータ拡張（デフォルト: False）
+        drop_zero_cp: score_cp==0の局面を除外（デフォルト: False）。
+            旧方式（--random-type engine）で生成したデータはランダム手の局面に
+            ダミーの評価値0が記録されているため、その除去に使用する。
     """
 
     def __init__(
         self,
         data_path: str | Path,
-        cp_scale: float = 500.0,
+        cp_scale: float = 1200.0,
         use_features: bool = False,
         cp_noise: float = 0.0,
         cp_filter_threshold: float | None = None,
         normalize_turn: bool = False,
         augment_flip: bool = False,
+        drop_zero_cp: bool = False,
     ) -> None:
         self.data_path = Path(data_path)
         self.cp_scale = cp_scale
@@ -184,6 +185,7 @@ class ShogiValueDataset(Dataset):
         self.cp_filter_threshold = cp_filter_threshold
         self.normalize_turn = normalize_turn
         self.augment_flip = augment_flip
+        self.drop_zero_cp = drop_zero_cp
         self.samples: list[dict] = []
 
         self._load_data()
@@ -202,6 +204,10 @@ class ShogiValueDataset(Dataset):
                     score_cp = sample.get("score_cp", 0)
                     if abs(score_cp) > self.cp_filter_threshold:
                         continue
+
+                # ダミーラベル除去: 評価値0の局面を除外
+                if self.drop_zero_cp and sample.get("score_cp", 0) == 0:
+                    continue
 
                 self.samples.append(sample)
 

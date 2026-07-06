@@ -17,6 +17,7 @@ from models import (
     normalize_cp,
     parse_sfen,
 )
+from models.dataset import normalize_to_black_view
 
 
 class TestNormalizeCp:
@@ -78,6 +79,70 @@ class TestSfenParser:
     def test_empty_hand(self) -> None:
         result = parse_sfen("startpos")
         assert result.hand.sum().item() == 0
+
+
+class TestNormalizeToBlackView:
+    """手番正規化（normalize_to_black_view）のテスト."""
+
+    def test_black_turn_unchanged(self) -> None:
+        """先手番の局面はそのまま返る."""
+        parsed = parse_sfen("startpos")
+        board, hand, turn, value, outcome = normalize_to_black_view(
+            parsed.board, parsed.hand, parsed.turn, 0.3, 1.0
+        )
+        assert torch.equal(board, parsed.board)
+        assert torch.equal(hand, parsed.hand)
+        assert turn.item() == 0
+        assert value == 0.3
+        assert outcome == 1.0
+
+    def test_white_turn_label_preserved(self) -> None:
+        """後手番の正規化で評価値・勝敗ラベルが不変であること（符号バグの回帰テスト）.
+
+        score_cp・outcomeは手番側視点のラベルなので、先後を入れ替えて
+        先手番に正規化しても視点は一致したまま（新先手＝元の手番側）。
+        符号やラベルを反転してはいけない。
+        """
+        parsed = parse_sfen("startpos moves 7g7f")  # 後手番
+        assert parsed.turn.item() == 1
+
+        _, _, turn, value, outcome = normalize_to_black_view(
+            parsed.board, parsed.hand, parsed.turn, 0.3, 1.0
+        )
+        assert turn.item() == 0
+        assert value == 0.3  # 反転してはいけない
+        assert outcome == 1.0  # 反転してはいけない
+
+    def test_white_turn_board_rotated(self) -> None:
+        """後手番の盤面が正しく180度回転＋先後入替されること.
+
+        「先手が7六歩を突いて後手番」の局面を正規化すると、
+        「相手（後手）が3四歩を突いて先手番」の盤面と一致する。
+        """
+        parsed = parse_sfen("startpos moves 7g7f")  # 後手番
+        board, hand, turn, _, _ = normalize_to_black_view(
+            parsed.board, parsed.hand, parsed.turn, 0.0, 0.5
+        )
+
+        expected = parse_sfen(
+            "sfen lnsgkgsnl/1r5b1/pppppp1pp/6p2/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
+        )
+        assert torch.equal(board, expected.board)
+        assert torch.equal(hand, expected.hand)
+        assert turn.item() == 0
+
+    def test_white_turn_hand_swapped(self) -> None:
+        """後手番の正規化で持ち駒の先後が入れ替わること."""
+        parsed = parse_sfen("startpos moves 7g7f")
+        hand = torch.zeros(14, dtype=torch.long)
+        hand[0] = 2  # 先手の歩2枚
+        hand[12] = 1  # 後手の角1枚
+
+        _, new_hand, _, _, _ = normalize_to_black_view(
+            parsed.board, hand, parsed.turn, 0.0, 0.5
+        )
+        assert new_hand[7].item() == 2  # 先手の歩 → 後手の歩
+        assert new_hand[5].item() == 1  # 後手の角 → 先手の角
 
 
 class TestValueTransformer:
@@ -172,6 +237,78 @@ class TestShogiValueDataset:
         assert collated["hand"].shape == (3, 14)
         assert collated["turn"].shape == (3,)
         assert collated["value"].shape == (3,)
+
+    def test_drop_zero_cp(self, sample_data_path: Path) -> None:
+        """score_cp==0の局面が除外されること."""
+        dataset = ShogiValueDataset(sample_data_path, drop_zero_cp=True)
+        assert len(dataset) == 2  # score_cp=0の1件が除外される
+        for i in range(len(dataset)):
+            assert dataset.samples[i]["score_cp"] != 0
+
+    def test_normalize_turn_value_sign(self, sample_data_path: Path) -> None:
+        """normalize_turn有効時も評価値の符号が保存されること（回帰テスト）.
+
+        score_cpは手番側視点なので、後手番局面を先手視点に正規化しても
+        value = tanh(score_cp / cp_scale) のまま変わらない。
+        """
+        cp_scale = 1200.0
+        dataset = ShogiValueDataset(
+            sample_data_path, cp_scale=cp_scale, normalize_turn=True
+        )
+        for i in range(len(dataset)):
+            sample = dataset[i]
+            expected = normalize_cp(dataset.samples[i]["score_cp"], cp_scale)
+            assert sample["turn"].item() == 0  # 全て先手番に正規化
+            assert sample["value"].item() == pytest.approx(expected, abs=1e-6)
+
+
+class TestSplitByGame:
+    """対局単位のtrain/val分割のテスト."""
+
+    @pytest.fixture
+    def multi_game_path(self, tmp_path: Path) -> Path:
+        lines = []
+        for game_id in range(10):
+            for ply in range(5):
+                lines.append(
+                    f'{{"sfen": "startpos", "score_cp": {game_id * 10 + ply}, '
+                    f'"ply": {ply}, "game_id": {game_id}, "result": "draw"}}'
+                )
+        path = tmp_path / "multi_game.jsonl"
+        path.write_text("\n".join(lines))
+        return path
+
+    def test_no_game_overlap(self, multi_game_path: Path) -> None:
+        """train/valに同じ対局の局面が跨らないこと."""
+        from train.train import split_by_game
+
+        dataset = ShogiValueDataset(multi_game_path)
+        train_subset, val_subset = split_by_game(dataset, val_split=0.2)
+
+        train_games = {dataset.samples[i]["game_id"] for i in train_subset.indices}
+        val_games = {dataset.samples[i]["game_id"] for i in val_subset.indices}
+
+        assert train_games.isdisjoint(val_games)
+        assert len(train_subset) + len(val_subset) == len(dataset)
+        assert len(val_games) == 2  # 10対局 × 0.2
+
+    def test_augment_flip_same_side(self, multi_game_path: Path) -> None:
+        """augment_flip有効時、反転版サンプルも同じ側に割り当てられること."""
+        from train.train import split_by_game
+
+        dataset = ShogiValueDataset(multi_game_path, augment_flip=True)
+        train_subset, val_subset = split_by_game(dataset, val_split=0.2)
+
+        base_len = len(dataset.samples)
+        assert len(train_subset) + len(val_subset) == len(dataset)
+
+        for indices in (train_subset.indices, val_subset.indices):
+            index_set = set(indices)
+            for idx in indices:
+                base_idx = idx - base_len if idx >= base_len else idx
+                # 元サンプルと反転版がペアで同じ側にあること
+                assert base_idx in index_set
+                assert base_idx + base_len in index_set
 
 
 class TestIntegration:
