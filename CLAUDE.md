@@ -57,7 +57,9 @@ shogi-ai/
 │   └── usi_server.py       # USIプロトコルサーバー
 ├── scripts/
 │   ├── usi_test.py         # USI疎通確認スクリプト ✓
-│   └── to_kif.py           # KIF形式変換スクリプト ✓
+│   ├── to_kif.py           # KIF形式変換スクリプト ✓
+│   ├── move_agreement.py   # 指し手一致率測定 ✓
+│   └── selfplay_match.py   # モデル同士の自己対局 ✓
 ├── env/
 │   └── README.md           # セットアップ手順
 └── reports/                # 評価レポート
@@ -121,6 +123,18 @@ python tools/gen_dataset.py -n 100 --weak-side alternate --weak-prob 0.3 --worke
 | `--weak-prob` | 0.5 | 弱い側がランダム手を指す確率 (0.0〜1.0) |
 | `--random-opening` | 32 | 序盤のランダム手数（多様性のため） |
 | `--random-type` | `full` | ランダム手の生成方式 (`engine`=go random, `full`=完全ランダム) |
+| `--record-pv-leaf` | 無効 | PV末端局面（静止局面）のレコードも記録 |
+| `--multipv` | 1 | 2以上で上位N手の子局面レコードも記録 |
+
+#### データ密度を上げるオプション
+
+- `--record-pv-leaf`: 探索評価値は読み筋（PV）末端の静的評価に対応するため、
+  PVを適用した静止局面にもラベルを付ける。1手読みで使う評価関数の学習に有効。
+  レコードには `"source": "pv_leaf"` が付く。
+- `--multipv N`: 1回の探索で上位N手を取得し、順位2以下の手の子局面に評価値
+  （符号反転済み）を付与。「良い手と悪い手の評価差」を効率的に収集できる。
+  レコードには `"source": "multipv"` が付く。
+- 両方有効にすると1対局あたりのレコード数が約4倍になる（depth 5, MultiPV 3実測）。
 
 **ランダム手生成方式の違い：**
 
@@ -354,6 +368,24 @@ PYTHONPATH=. python train/train.py \
 | `--drop-zero-cp` | - | score_cp==0の局面を除外（旧方式データのダミーラベル対策） |
 | `--cp-scale` | 1200 | 評価値正規化のスケール |
 | `--variance-reg-weight` | 0 | 分散正則化の重み（通常は不要） |
+| `--ema-decay` | 0 | EMA減衰率（0=無効、推奨: 0.999）。有効時はEMA重みで検証・保存 |
+| `--value-loss` | mse | 評価値損失（`mse` / `huber`） |
+| `--huber-delta` | 0.5 | Huber lossの遷移点 |
+| `--cp-clamp` | なし | 評価値を±この値に丸める（除外せず学習に残す） |
+| `--target-mode` | cp | ターゲット空間（`cp`=tanh正規化, `wdl`=勝率でelmoブレンド） |
+| `--wdl-scale` | 600 | cp→勝率変換のシグモイドスケール |
+| `--wdl-lambda` | 0.5 | elmoブレンドの教師評価値の重み（0〜1） |
+| `--use-king-relative` | - | 玉相対位置埋め込み（HalfKP相当の帰納バイアス） |
+| `--use-2d-pos` | - | 2D位置埋め込み（学習可能な段・筋埋め込み） |
+| `--use-discrete-hand` | - | 持ち駒枚数を離散埋め込みで表現 |
+
+#### 評価値ターゲットの選択
+
+- `--target-mode cp`（デフォルト）: `tanh(score_cp / cp_scale)` を回帰
+- `--target-mode wdl`: 教師評価値を勝率 `sigmoid(score_cp / wdl_scale)` に変換し、
+  実際の勝敗結果と `--wdl-lambda` でブレンド（elmo式）。
+  `target = λ × 評価値勝率 + (1−λ) × 勝敗` を [-1, 1] にマップして回帰。
+  推論時はcheckpointの `target_mode` から自動で逆変換される。
 
 #### 出力ファイル
 
@@ -433,6 +465,35 @@ best_move, score = evaluator.find_best_move(board)
 - 現在は1手読みのみ（各合法手の評価値を比較）
 - 探索アルゴリズム（αβ等）は未実装
 
+## 評価関数の計測
+
+val_lossより直接的に「強さ」を測る2つのスクリプト。改善を入れるたびに
+効果を数字で確認する。
+
+### 指し手一致率 (`scripts/move_agreement.py`)
+
+モデルの1手読みが選ぶ手と教師エンジンの最善手の一致率を測定。
+序盤（ply<30）/中盤（30-79）/終盤（80+）別の集計付き。
+
+```bash
+PYTHONPATH=. python scripts/move_agreement.py \
+    --model checkpoints/best.pt \
+    --data data/raw/dataset.jsonl \
+    --depth 10 --limit 200 --output reports/agreement.json
+```
+
+### モデル同士の自己対局 (`scripts/selfplay_match.py`)
+
+2つのcheckpointを1手読み同士で対局させ、勝敗と推定レート差を出す。
+ランダム開始局面から先後入替のペア対局で公平性を確保。
+
+```bash
+PYTHONPATH=. python scripts/selfplay_match.py \
+    --model-a checkpoints/new.pt \
+    --model-b checkpoints/old.pt \
+    --games 20 --output reports/match.json
+```
+
 ## コーディング規約
 
 - 型ヒント必須
@@ -478,8 +539,8 @@ best_move, score = evaluator.find_best_move(board)
   - `train.py`: 末期エポックでSWAを有効化
   - `torch.optim.swa_utils.AveragedModel`使用
 
-- [ ] **EMA (Exponential Moving Average)** - 推論用重み平滑化
-  - `train.py`: 学習中にEMA重みを維持、推論時はEMA版を使用
+- [x] **EMA (Exponential Moving Average)** - 推論用重み平滑化
+  - `train.py`: `--ema-decay`オプション（推奨: 0.999）
 
 - [ ] **検証セット分割評価** - 弱点の可視化
   - `train.py`: 序盤(ply<30)/中盤(30-80)/終盤(80+)別にval_lossを計算・ログ出力
