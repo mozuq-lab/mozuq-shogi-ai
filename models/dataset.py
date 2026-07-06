@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from models.sfen_parser import parse_sfen
-from models.value_transformer import normalize_cp
+from models.value_transformer import cp_to_wdl, normalize_cp
 from models.features import compute_all_features
 
 if TYPE_CHECKING:
@@ -165,6 +165,15 @@ class ShogiValueDataset(Dataset):
         drop_zero_cp: score_cp==0の局面を除外（デフォルト: False）。
             旧方式（--random-type engine）で生成したデータはランダム手の局面に
             ダミーの評価値0が記録されているため、その除去に使用する。
+        cp_clamp: 評価値を±この値に丸める（デフォルト: None、無効）。
+            cp_filter_thresholdの「除外」と異なり、大差局面を学習に残せる。
+        target_mode: 評価値ターゲットの空間（デフォルト: "cp"）。
+            "cp": tanh(score_cp / cp_scale)
+            "wdl": 勝率 sigmoid(score_cp / wdl_scale) と実際の勝敗を
+                   elmo式にブレンドし、[-1, 1]にマップ
+        wdl_scale: cp→勝率変換のシグモイドスケール（デフォルト: 600）
+        wdl_lambda: elmoブレンドの教師評価値の重み（デフォルト: 0.5）。
+            target = wdl_lambda * 評価値勝率 + (1 - wdl_lambda) * 勝敗
     """
 
     def __init__(
@@ -177,7 +186,14 @@ class ShogiValueDataset(Dataset):
         normalize_turn: bool = False,
         augment_flip: bool = False,
         drop_zero_cp: bool = False,
+        cp_clamp: float | None = None,
+        target_mode: str = "cp",
+        wdl_scale: float = 600.0,
+        wdl_lambda: float = 0.5,
     ) -> None:
+        if target_mode not in ("cp", "wdl"):
+            raise ValueError(f"Unknown target_mode: {target_mode}")
+
         self.data_path = Path(data_path)
         self.cp_scale = cp_scale
         self.use_features = use_features
@@ -186,6 +202,10 @@ class ShogiValueDataset(Dataset):
         self.normalize_turn = normalize_turn
         self.augment_flip = augment_flip
         self.drop_zero_cp = drop_zero_cp
+        self.cp_clamp = cp_clamp
+        self.target_mode = target_mode
+        self.wdl_scale = wdl_scale
+        self.wdl_lambda = wdl_lambda
         self.samples: list[dict] = []
 
         self._load_data()
@@ -248,11 +268,12 @@ class ShogiValueDataset(Dataset):
         if self.cp_noise > 0:
             score_cp = score_cp + random.gauss(0, self.cp_noise)
 
+        # 評価値クランプ（大差局面を除外せず丸めて学習に残す）
+        if self.cp_clamp is not None:
+            score_cp = max(-self.cp_clamp, min(self.cp_clamp, score_cp))
+
         # SFENをパース
         parsed = parse_sfen(sfen)
-
-        # 評価値を正規化
-        value = normalize_cp(score_cp, self.cp_scale)
 
         # 勝敗ラベルを手番視点に変換
         result_str = sample.get("result", "draw")
@@ -265,6 +286,15 @@ class ShogiValueDataset(Dataset):
             outcome = 0.0 if is_black_turn else 1.0
         else:  # draw
             outcome = 0.5
+
+        # 評価値ターゲットを計算
+        if self.target_mode == "wdl":
+            # elmo式: 教師評価値の勝率と実際の勝敗をブレンドし、[-1, 1]にマップ
+            eval_wr = cp_to_wdl(score_cp, self.wdl_scale)
+            blended = self.wdl_lambda * eval_wr + (1.0 - self.wdl_lambda) * outcome
+            value = 2.0 * blended - 1.0
+        else:
+            value = normalize_cp(score_cp, self.cp_scale)
 
         board = parsed.board
         hand = parsed.hand

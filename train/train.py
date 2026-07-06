@@ -91,6 +91,12 @@ class TrainConfig:
     cp_noise: float = 0.0
     cp_filter_threshold: float | None = None
     drop_zero_cp: bool = False
+    cp_clamp: float | None = None
+
+    # 評価値ターゲット（cp: tanh正規化, wdl: 勝率空間でelmoブレンド）
+    target_mode: str = "cp"
+    wdl_scale: float = 600.0
+    wdl_lambda: float = 0.5
 
     # データ拡張
     normalize_turn: bool = False
@@ -446,6 +452,10 @@ def train(config: TrainConfig) -> None:
         normalize_turn=config.normalize_turn,
         augment_flip=config.augment_flip,
         drop_zero_cp=config.drop_zero_cp,
+        cp_clamp=config.cp_clamp,
+        target_mode=config.target_mode,
+        wdl_scale=config.wdl_scale,
+        wdl_lambda=config.wdl_lambda,
     )
     logger.info(f"Dataset size: {len(dataset)}")
 
@@ -652,6 +662,12 @@ def main() -> None:
     parser.add_argument("--cp-noise", type=float, default=0.0, help="評価値ノイズの標準偏差（cp）")
     parser.add_argument("--cp-filter-threshold", type=float, default=None, help="評価値フィルタの閾値（cp）")
     parser.add_argument("--drop-zero-cp", action="store_true", help="score_cp==0の局面を除外（旧方式データのダミーラベル対策）")
+    parser.add_argument("--cp-clamp", type=float, default=None, help="評価値を±この値に丸める（filterと異なり大差局面を学習に残す）")
+
+    # 評価値ターゲット
+    parser.add_argument("--target-mode", type=str, default="cp", choices=["cp", "wdl"], help="ターゲット空間（cp: tanh正規化, wdl: 勝率でelmoブレンド）")
+    parser.add_argument("--wdl-scale", type=float, default=600.0, help="cp→勝率変換のシグモイドスケール")
+    parser.add_argument("--wdl-lambda", type=float, default=0.5, help="elmoブレンドの教師評価値の重み（0〜1）")
 
     # データ拡張
     parser.add_argument("--normalize-turn", action="store_true", help="後手番を先手視点に正規化")
@@ -698,6 +714,10 @@ def main() -> None:
         cp_noise=args.cp_noise,
         cp_filter_threshold=args.cp_filter_threshold,
         drop_zero_cp=args.drop_zero_cp,
+        cp_clamp=args.cp_clamp,
+        target_mode=args.target_mode,
+        wdl_scale=args.wdl_scale,
+        wdl_lambda=args.wdl_lambda,
         normalize_turn=args.normalize_turn,
         augment_flip=args.augment_flip,
         num_workers=args.num_workers,

@@ -123,3 +123,23 @@ class TestComputeValueLoss:
         )
         train(config)
         assert (tmp_path / "ckpt" / "final.pt").exists()
+
+
+class TestTrainWdl:
+    """WDLターゲットでの学習テスト."""
+
+    def test_train_with_wdl(self, small_data: Path, tmp_path: Path) -> None:
+        """wdlターゲットで学習が完了し、configがcheckpointに保存される."""
+        config = _small_config(
+            small_data, tmp_path / "ckpt",
+            target_mode="wdl", wdl_scale=600.0, wdl_lambda=0.5,
+            cp_clamp=2000.0,
+        )
+        train(config)
+
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu", weights_only=False
+        )
+        assert ckpt["config"]["target_mode"] == "wdl"
+        assert ckpt["config"]["wdl_scale"] == 600.0
+        assert ckpt["config"]["cp_clamp"] == 2000.0

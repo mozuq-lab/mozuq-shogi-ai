@@ -296,3 +296,31 @@ def denormalize_cp(value: float, scale: float = 1200.0) -> float:
     # クリップして数値安定性を確保
     value = max(-0.9999, min(0.9999, value))
     return math.atanh(value) * scale
+
+
+def cp_to_wdl(cp: float, scale: float = 600.0) -> float:
+    """centipawnを勝率[0, 1]に変換（シグモイド）.
+
+    Args:
+        cp: 評価値（centipawn）
+        scale: シグモイドのスケーリングパラメータ
+
+    Returns:
+        勝率（0〜1）
+    """
+    return 1.0 / (1.0 + math.exp(-cp / scale))
+
+
+def wdl_to_cp(wr: float, scale: float = 600.0) -> float:
+    """勝率[0, 1]をcentipawnに戻す（ロジット）.
+
+    Args:
+        wr: 勝率（0〜1）
+        scale: シグモイドのスケーリングパラメータ
+
+    Returns:
+        評価値（centipawn）
+    """
+    # クリップして数値安定性を確保
+    wr = max(0.0001, min(0.9999, wr))
+    return scale * math.log(wr / (1.0 - wr))

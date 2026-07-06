@@ -11,7 +11,13 @@ from typing import TYPE_CHECKING
 import shogi
 import torch
 
-from models import ValueTransformer, denormalize_cp, parse_sfen, compute_all_features
+from models import (
+    ValueTransformer,
+    compute_all_features,
+    denormalize_cp,
+    parse_sfen,
+    wdl_to_cp,
+)
 from models.dataset import normalize_to_black_view
 
 if TYPE_CHECKING:
@@ -38,6 +44,8 @@ class Evaluator:
             self.use_features,
             self.normalize_turn,
             self.cp_scale,
+            self.target_mode,
+            self.wdl_scale,
         ) = self._load_model(Path(model_path))
 
     def _get_device(self, device_str: str) -> torch.device:
@@ -53,7 +61,7 @@ class Evaluator:
 
     def _load_model(
         self, model_path: Path
-    ) -> tuple[ValueTransformer, bool, bool, float]:
+    ) -> tuple[ValueTransformer, bool, bool, float, str, float]:
         """モデルを読み込み."""
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
@@ -63,6 +71,9 @@ class Evaluator:
         normalize_turn = config.get("normalize_turn", False)
         # 学習時の正規化スケール（denormalizeに同じ値を使わないと評価値が歪む）
         cp_scale = config.get("cp_scale", 500.0)
+        # ターゲット空間（cp: tanh正規化, wdl: 勝率空間）
+        target_mode = config.get("target_mode", "cp")
+        wdl_scale = config.get("wdl_scale", 600.0)
 
         # Attention Pooling導入前のcheckpointはconfigにキーが無いため、
         # state_dictの実際のキーから判定する
@@ -85,7 +96,23 @@ class Evaluator:
         model.to(self.device)
         model.eval()
 
-        return model, use_features, normalize_turn, cp_scale
+        return model, use_features, normalize_turn, cp_scale, target_mode, wdl_scale
+
+    def _to_cp(self, value: float) -> int:
+        """モデル出力[-1, 1]をcentipawnに変換.
+
+        学習時のターゲット空間（target_mode）に応じた逆変換を行う。
+
+        Args:
+            value: モデル出力
+
+        Returns:
+            評価値（centipawn）
+        """
+        if self.target_mode == "wdl":
+            wr = (value + 1.0) / 2.0
+            return int(wdl_to_cp(wr, self.wdl_scale))
+        return int(denormalize_cp(value, self.cp_scale))
 
     def _prepare_single(
         self, parsed: ParsedPosition
@@ -171,7 +198,7 @@ class Evaluator:
         """
         parsed = parse_sfen(sfen)
         value = self._evaluate_batch([parsed])[0].item()
-        return int(denormalize_cp(value, self.cp_scale))
+        return self._to_cp(value)
 
     def evaluate_board(self, board: shogi.Board) -> int:
         """python-shogiのBoardオブジェクトを評価.
@@ -216,6 +243,6 @@ class Evaluator:
         values = -self._evaluate_batch(parsed_list)
 
         best_idx = int(torch.argmax(values).item())
-        best_score = int(denormalize_cp(values[best_idx].item(), self.cp_scale))
+        best_score = self._to_cp(values[best_idx].item())
 
         return legal_moves[best_idx].usi(), best_score

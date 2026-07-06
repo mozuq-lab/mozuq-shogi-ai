@@ -13,9 +13,11 @@ from models import (
     ShogiValueDataset,
     ValueTransformer,
     collate_fn,
+    cp_to_wdl,
     denormalize_cp,
     normalize_cp,
     parse_sfen,
+    wdl_to_cp,
 )
 from models.dataset import normalize_to_black_view
 
@@ -39,6 +41,26 @@ class TestNormalizeCp:
             normalized = normalize_cp(cp)
             denormalized = denormalize_cp(normalized)
             assert abs(denormalized - cp) < 1.0  # 誤差1cp以内
+
+
+class TestWdlConversion:
+    """cp⇔勝率変換のテスト."""
+
+    def test_zero_cp_is_even(self) -> None:
+        assert cp_to_wdl(0) == 0.5
+
+    def test_positive_cp_above_half(self) -> None:
+        assert cp_to_wdl(600) > 0.7  # sigmoid(1) ≈ 0.73
+
+    def test_round_trip(self) -> None:
+        for cp in [-2000, -500, 0, 500, 2000]:
+            wr = cp_to_wdl(cp)
+            assert abs(wdl_to_cp(wr) - cp) < 1.0
+
+    def test_wdl_to_cp_clipped(self) -> None:
+        # 極端な勝率でも有限値を返す
+        assert wdl_to_cp(1.0) < 10000
+        assert wdl_to_cp(0.0) > -10000
 
 
 class TestSfenParser:
@@ -260,6 +282,53 @@ class TestShogiValueDataset:
             expected = normalize_cp(dataset.samples[i]["score_cp"], cp_scale)
             assert sample["turn"].item() == 0  # 全て先手番に正規化
             assert sample["value"].item() == pytest.approx(expected, abs=1e-6)
+
+    def test_cp_clamp(self, tmp_path: Path) -> None:
+        """cp_clampで評価値が丸められる（除外されない）."""
+        data = [
+            '{"sfen": "startpos", "score_cp": 5000, "ply": 0, "game_id": 0, "result": "draw"}',
+        ]
+        path = tmp_path / "clamp.jsonl"
+        path.write_text("\n".join(data))
+
+        cp_scale = 1200.0
+        dataset = ShogiValueDataset(path, cp_scale=cp_scale, cp_clamp=2000.0)
+        assert len(dataset) == 1  # 除外されない
+        expected = normalize_cp(2000.0, cp_scale)  # 5000 → 2000に丸め
+        assert dataset[0]["value"].item() == pytest.approx(expected, abs=1e-6)
+
+    def test_wdl_target(self, sample_data_path: Path) -> None:
+        """wdlターゲットが評価値勝率と勝敗のブレンドになる."""
+        wdl_scale = 600.0
+        wdl_lambda = 0.5
+        dataset = ShogiValueDataset(
+            sample_data_path,
+            target_mode="wdl",
+            wdl_scale=wdl_scale,
+            wdl_lambda=wdl_lambda,
+        )
+        for i in range(len(dataset)):
+            raw = dataset.samples[i]
+            eval_wr = cp_to_wdl(raw["score_cp"], wdl_scale)
+            outcome = 0.5  # sample_data_pathは全てdraw
+            expected = 2.0 * (wdl_lambda * eval_wr + (1 - wdl_lambda) * outcome) - 1.0
+            assert dataset[i]["value"].item() == pytest.approx(expected, abs=1e-6)
+
+    def test_wdl_lambda_one_ignores_outcome(self, tmp_path: Path) -> None:
+        """wdl_lambda=1.0では勝敗を無視し評価値勝率のみを使う."""
+        data = [
+            '{"sfen": "startpos", "score_cp": 300, "ply": 0, "game_id": 0, "result": "black_win"}',
+        ]
+        path = tmp_path / "wdl.jsonl"
+        path.write_text("\n".join(data))
+
+        dataset = ShogiValueDataset(path, target_mode="wdl", wdl_lambda=1.0)
+        expected = 2.0 * cp_to_wdl(300, 600.0) - 1.0
+        assert dataset[0]["value"].item() == pytest.approx(expected, abs=1e-6)
+
+    def test_invalid_target_mode_raises(self, sample_data_path: Path) -> None:
+        with pytest.raises(ValueError):
+            ShogiValueDataset(sample_data_path, target_mode="invalid")
 
 
 class TestSplitByGame:
