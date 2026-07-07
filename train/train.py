@@ -15,7 +15,8 @@ import json
 import logging
 import sys
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,7 +29,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from models import (
     ShogiRankingPairDataset,
@@ -404,7 +405,7 @@ def train_epoch(
     aux_loss_weight: float = 0.1,
     grad_clip_norm: float = 1.0,
     label_smoothing: float = 0.05,
-    variance_reg_weight: float = 0.1,
+    variance_reg_weight: float = 0.0,
     ema_model: AveragedModel | None = None,
     value_loss_type: str = "mse",
     huber_delta: float = 0.5,
@@ -620,13 +621,75 @@ def run_offline_agreement(
     return measure_agreement_offline(evaluator, data_path, limit=limit)
 
 
-def train(config: TrainConfig) -> None:
-    """学習メイン処理."""
-    # デバイス
-    device = get_device(config.device)
-    logger.info(f"Using device: {device}")
+def write_log(log_path: Path, config: TrainConfig, state: TrainState) -> None:
+    """学習ログをJSONファイルに書き出す.
 
-    # データセット
+    Args:
+        log_path: 出力先のJSONファイルパス
+        config: 学習設定
+        state: 学習状態
+    """
+    log_data = {
+        "config": vars(config),
+        "train_losses": state.train_losses,
+        "val_losses": state.val_losses,
+        "best_val_loss": state.best_val_loss,
+        "ranking_val": state.ranking_val,
+        "agreement": state.agreement,
+    }
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2)
+
+
+def _make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    collate: Callable[[list[dict[str, torch.Tensor]]], dict[str, torch.Tensor]],
+    config: TrainConfig,
+    device: torch.device,
+) -> DataLoader:
+    """共通設定でDataLoaderを構築する.
+
+    num_workers/pin_memory/persistent_workersの組み合わせを一箇所に集約する。
+
+    Args:
+        dataset: ラップするデータセット
+        batch_size: バッチサイズ
+        shuffle: サンプル順をシャッフルするかどうか
+        collate: バッチ構築に使うcollate関数
+        config: 学習設定（num_workersを参照）
+        device: 実行デバイス（pin_memoryの判定に使用）
+
+    Returns:
+        構築されたDataLoader
+    """
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate,
+        num_workers=config.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=config.num_workers > 0,
+    )
+
+
+def _build_main_loaders(
+    config: TrainConfig, device: torch.device
+) -> tuple[ShogiValueDataset, DataLoader, DataLoader]:
+    """メインデータセットとtrain/val用DataLoaderを構築する.
+
+    対局（game_id）単位でtrain/valを分割し、同一対局の局面が
+    train/valに跨るリークを防ぐ。
+
+    Args:
+        config: 学習設定
+        device: 実行デバイス
+
+    Returns:
+        (データセット全体, 訓練用DataLoader, 検証用DataLoader)
+    """
     logger.info(f"Loading dataset: {config.data_path}")
     logger.info(f"Use features: {config.use_features}")
     dataset = ShogiValueDataset(
@@ -649,94 +712,125 @@ def train(config: TrainConfig) -> None:
     train_dataset, val_dataset = split_by_game(dataset, config.val_split)
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-    # rankingペアデータセット（メインと同じ対局分割を共有してリークを防ぐ）
-    ranking_train_loader: DataLoader | None = None
-    ranking_val_loader: DataLoader | None = None
-    if config.ranking_weight > 0:
-        game_ids = [s.get("game_id", 0) for s in dataset.samples]
-        val_games = select_val_games(game_ids, config.val_split)
-        if val_games is None:
-            # 対局単位の分割を共有できないと、rankingペアだけが
-            # 検証局面を訓練に使うリークが起きるため明示エラーにする
-            raise ValueError(
-                "--ranking-weightにはgame_idが2対局以上あるデータが必要です"
-            )
+    train_loader = _make_loader(
+        train_dataset, config.batch_size, True, collate_fn, config, device
+    )
+    val_loader = _make_loader(
+        val_dataset, config.batch_size, False, collate_fn, config, device
+    )
 
-        ranking_train_dataset = ShogiRankingPairDataset(
+    return dataset, train_loader, val_loader
+
+
+def _build_ranking_loaders(
+    config: TrainConfig,
+    dataset: ShogiValueDataset,
+    device: torch.device,
+) -> tuple[DataLoader | None, DataLoader | None]:
+    """rankingペアのtrain/val用DataLoaderを構築する.
+
+    config.ranking_weight <= 0の場合は(None, None)を返す。
+    メインデータセットと同じ対局分割（select_val_games）を共有することで、
+    rankingペアだけが検証局面を訓練に使うリークを防ぐ。
+
+    Args:
+        config: 学習設定
+        dataset: メインのShogiValueDataset（game_id分割の共有に使用）
+        device: 実行デバイス
+
+    Returns:
+        (rankingペア訓練用DataLoader, rankingペア検証用DataLoader)。
+        ranking_weight <= 0の場合は(None, None)。
+
+    Raises:
+        ValueError: game_idが2対局以上ないため対局単位の分割を共有できない場合、
+            またはrankingペアが1つも構築できない場合。
+    """
+    if config.ranking_weight <= 0:
+        return None, None
+
+    game_ids = [s.get("game_id", 0) for s in dataset.samples]
+    val_games = select_val_games(game_ids, config.val_split)
+    if val_games is None:
+        # 対局単位の分割を共有できないと、rankingペアだけが
+        # 検証局面を訓練に使うリークが起きるため明示エラーにする
+        raise ValueError(
+            "--ranking-weightにはgame_idが2対局以上あるデータが必要です"
+        )
+
+    ranking_train_dataset = ShogiRankingPairDataset(
+        config.data_path,
+        use_features=config.use_features,
+        normalize_turn=config.normalize_turn,
+        augment_flip=config.augment_flip,
+        min_gap_cp=config.ranking_min_gap,
+        exclude_game_ids=val_games,
+    )
+    if len(ranking_train_dataset) == 0:
+        raise ValueError(
+            "rankingペアが構築できません。--ranking-weightには"
+            "candidatesフィールド付きデータ（gen_dataset.py --multipv 2以上）"
+            "が必要です"
+        )
+
+    # ペアは1サンプル2局面なので、バッチサイズを半分にして
+    # 1ステップあたりのforward局面数をメインバッチと揃える
+    ranking_batch_size = max(1, config.batch_size // 2)
+    ranking_train_loader = _make_loader(
+        ranking_train_dataset,
+        ranking_batch_size,
+        True,
+        ranking_collate_fn,
+        config,
+        device,
+    )
+
+    ranking_val_loader: DataLoader | None = None
+    n_val_pairs = 0
+    if val_games is not None:
+        ranking_val_dataset = ShogiRankingPairDataset(
             config.data_path,
             use_features=config.use_features,
             normalize_turn=config.normalize_turn,
-            augment_flip=config.augment_flip,
+            augment_flip=False,
             min_gap_cp=config.ranking_min_gap,
-            exclude_game_ids=val_games,
+            include_game_ids=val_games,
         )
-        if len(ranking_train_dataset) == 0:
-            raise ValueError(
-                "rankingペアが構築できません。--ranking-weightには"
-                "candidatesフィールド付きデータ（gen_dataset.py --multipv 2以上）"
-                "が必要です"
+        n_val_pairs = len(ranking_val_dataset)
+        if n_val_pairs > 0:
+            ranking_val_loader = _make_loader(
+                ranking_val_dataset,
+                ranking_batch_size,
+                False,
+                ranking_collate_fn,
+                config,
+                device,
             )
-
-        # ペアは1サンプル2局面なので、バッチサイズを半分にして
-        # 1ステップあたりのforward局面数をメインバッチと揃える
-        ranking_batch_size = max(1, config.batch_size // 2)
-        ranking_train_loader = DataLoader(
-            ranking_train_dataset,
-            batch_size=ranking_batch_size,
-            shuffle=True,
-            collate_fn=ranking_collate_fn,
-            num_workers=config.num_workers,
-            pin_memory=device.type == "cuda",
-            persistent_workers=config.num_workers > 0,
-        )
-
-        n_val_pairs = 0
-        if val_games is not None:
-            ranking_val_dataset = ShogiRankingPairDataset(
-                config.data_path,
-                use_features=config.use_features,
-                normalize_turn=config.normalize_turn,
-                augment_flip=False,
-                min_gap_cp=config.ranking_min_gap,
-                include_game_ids=val_games,
-            )
-            n_val_pairs = len(ranking_val_dataset)
-            if n_val_pairs > 0:
-                ranking_val_loader = DataLoader(
-                    ranking_val_dataset,
-                    batch_size=ranking_batch_size,
-                    shuffle=False,
-                    collate_fn=ranking_collate_fn,
-                    num_workers=config.num_workers,
-                    pin_memory=device.type == "cuda",
-                    persistent_workers=config.num_workers > 0,
-                )
-        logger.info(
-            f"Ranking pairs: train={len(ranking_train_dataset)}, "
-            f"val={n_val_pairs} (min_gap={config.ranking_min_gap}cp)"
-        )
-
-    # データローダー
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=config.num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=config.num_workers > 0,
+    logger.info(
+        f"Ranking pairs: train={len(ranking_train_dataset)}, "
+        f"val={n_val_pairs} (min_gap={config.ranking_min_gap}cp)"
     )
 
-    # モデル
+    return ranking_train_loader, ranking_val_loader
+
+
+def _build_model_and_optimizer(
+    config: TrainConfig, device: torch.device
+) -> tuple[
+    nn.Module,
+    AveragedModel | None,
+    torch.optim.Optimizer,
+    torch.optim.lr_scheduler.LRScheduler,
+]:
+    """モデル・EMAモデル・optimizer・schedulerを構築する.
+
+    Args:
+        config: 学習設定
+        device: 実行デバイス
+
+    Returns:
+        (モデル, EMAモデル（ema_decay<=0の場合はNone）, optimizer, scheduler)
+    """
     model = ValueTransformer(
         d_model=config.d_model,
         n_heads=config.n_heads,
@@ -769,6 +863,28 @@ def train(config: TrainConfig) -> None:
         optimizer,
         T_max=config.epochs - config.warmup_epochs,
         eta_min=config.lr * 0.01,
+    )
+
+    return model, ema_model, optimizer, scheduler
+
+
+def train(config: TrainConfig) -> None:
+    """学習メイン処理."""
+    # デバイス
+    device = get_device(config.device)
+    logger.info(f"Using device: {device}")
+
+    # データセットとメインのtrain/valローダー
+    dataset, train_loader, val_loader = _build_main_loaders(config, device)
+
+    # rankingペアデータセット（メインと同じ対局分割を共有してリークを防ぐ）
+    ranking_train_loader, ranking_val_loader = _build_ranking_loaders(
+        config, dataset, device
+    )
+
+    # モデル・EMAモデル・オプティマイザ・スケジューラ
+    model, ema_model, optimizer, scheduler = _build_model_and_optimizer(
+        config, device
     )
 
     # 状態
@@ -893,16 +1009,7 @@ def train(config: TrainConfig) -> None:
                 )
 
         # ログ保存
-        log_data = {
-            "config": vars(config),
-            "train_losses": state.train_losses,
-            "val_losses": state.val_losses,
-            "best_val_loss": state.best_val_loss,
-            "ranking_val": state.ranking_val,
-            "agreement": state.agreement,
-        }
-        with open(log_path, "w") as f:
-            json.dump(log_data, f, indent=2)
+        write_log(log_path, config, state)
 
     # 最終保存
     total_time = time.time() - start_time
@@ -934,16 +1041,7 @@ def train(config: TrainConfig) -> None:
             model, optimizer, scheduler, config, state,
             ema_model=ema_model,
         )
-        log_data = {
-            "config": vars(config),
-            "train_losses": state.train_losses,
-            "val_losses": state.val_losses,
-            "best_val_loss": state.best_val_loss,
-            "ranking_val": state.ranking_val,
-            "agreement": state.agreement,
-        }
-        with open(log_path, "w") as f:
-            json.dump(log_data, f, indent=2)
+        write_log(log_path, config, state)
 
 
 def main() -> None:
@@ -1029,51 +1127,23 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    config = TrainConfig(
-        data_path=args.data,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device=args.device,
-        output_dir=args.output_dir,
-        resume=args.resume,
-        val_split=args.val_split,
-        save_every=args.save_every,
-        log_every=args.log_every,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        ffn_dim=args.ffn_dim,
-        dropout=args.dropout,
-        use_features=args.use_features,
-        use_attention_pooling=not args.no_attention_pooling,
-        use_king_relative=args.use_king_relative,
-        use_2d_pos=args.use_2d_pos,
-        use_discrete_hand=args.use_discrete_hand,
-        aux_loss_weight=args.aux_loss_weight,
-        warmup_epochs=args.warmup_epochs,
-        grad_clip_norm=args.grad_clip_norm,
-        label_smoothing=args.label_smoothing,
-        cp_scale=args.cp_scale,
-        cp_noise=args.cp_noise,
-        cp_filter_threshold=args.cp_filter_threshold,
-        drop_zero_cp=args.drop_zero_cp,
-        cp_clamp=args.cp_clamp,
-        target_mode=args.target_mode,
-        wdl_scale=args.wdl_scale,
-        wdl_lambda=args.wdl_lambda,
-        normalize_turn=args.normalize_turn,
-        augment_flip=args.augment_flip,
-        num_workers=args.num_workers,
-        variance_reg_weight=args.variance_reg_weight,
-        ema_decay=args.ema_decay,
-        value_loss=args.value_loss,
-        huber_delta=args.huber_delta,
-        ranking_weight=args.ranking_weight,
-        ranking_min_gap=args.ranking_min_gap,
-        agreement_data=args.agreement_data,
-        agreement_limit=args.agreement_limit,
-    )
+    # argparseの結果をTrainConfigへ自動転記する。
+    # フィールド名とargのdest（ハイフン→アンダースコア）は基本的に一致するが、
+    # 以下の2つだけ名前が異なる/論理が反転しているため個別に扱う:
+    #   --data                  -> data_path
+    #   --no-attention-pooling  -> use_attention_pooling（store_trueを論理反転）
+    # weight_decayのように対応するCLIオプションが無いフィールドは、
+    # TrainConfigのデフォルト値がそのまま使われる（従来の挙動と同じ）。
+    config_kwargs: dict[str, object] = {}
+    for f in fields(TrainConfig):
+        if f.name == "data_path":
+            config_kwargs[f.name] = args.data
+        elif f.name == "use_attention_pooling":
+            config_kwargs[f.name] = not args.no_attention_pooling
+        elif hasattr(args, f.name):
+            config_kwargs[f.name] = getattr(args, f.name)
+
+    config = TrainConfig(**config_kwargs)
 
     train(config)
 

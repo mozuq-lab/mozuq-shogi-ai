@@ -149,7 +149,7 @@ def augment_horizontal_flip(
     return flip_board_horizontal(board), hand  # 持ち駒は変わらない
 
 
-def _stack_features(board: torch.Tensor) -> torch.Tensor:
+def stack_features(board: torch.Tensor) -> torch.Tensor:
     """盤面から拡張特徴量テンソル (81, 10) を構築.
 
     Args:
@@ -356,7 +356,7 @@ class ShogiValueDataset(Dataset):
 
         # 拡張特徴量を追加（変換後の盤面から計算）
         if self.use_features:
-            result["features"] = _stack_features(board)
+            result["features"] = stack_features(board)
 
         return result
 
@@ -462,7 +462,7 @@ class ShogiRankingPairDataset(Dataset):
 
         result = {"board": board, "hand": hand, "turn": turn}
         if self.use_features:
-            result["features"] = _stack_features(board)
+            result["features"] = stack_features(board)
         return result
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:

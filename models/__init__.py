@@ -7,6 +7,7 @@ from models.dataset import (
     ShogiValueDataset,
     collate_fn,
     ranking_collate_fn,
+    stack_features,
 )
 from models.features import compute_all_features, compute_attack_map, compute_king_safety
 from models.sfen_parser import ParsedPosition, parse_sfen
@@ -24,6 +25,7 @@ __all__ = [
     "ShogiRankingPairDataset",
     "collate_fn",
     "ranking_collate_fn",
+    "stack_features",
     "ParsedPosition",
     "parse_sfen",
     "normalize_cp",

@@ -13,9 +13,9 @@ import torch
 
 from models import (
     ValueTransformer,
-    compute_all_features,
     denormalize_cp,
     parse_sfen,
+    stack_features,
     wdl_to_cp,
 )
 from models.dataset import normalize_to_black_view
@@ -145,14 +145,7 @@ class Evaluator:
 
         features: torch.Tensor | None = None
         if self.use_features:
-            feat_dict = compute_all_features(board)
-            features = torch.cat([
-                feat_dict["attack_map"],
-                feat_dict["king_distance"],
-                feat_dict["piece_value"].unsqueeze(1),
-                feat_dict["control"].unsqueeze(1),
-                feat_dict["king_safety"],
-            ], dim=1)
+            features = stack_features(board)
 
         return board, hand, turn, features
 
