@@ -143,3 +143,131 @@ class TestTrainWdl:
         assert ckpt["config"]["target_mode"] == "wdl"
         assert ckpt["config"]["wdl_scale"] == 600.0
         assert ckpt["config"]["cp_clamp"] == 2000.0
+
+
+@pytest.fixture
+def candidates_data(tmp_path: Path) -> Path:
+    """candidatesフィールド付きの小規模学習データを生成（3対局 × 4局面）."""
+    import json
+
+    moves_seq = ["7g7f", "3c3d", "2g2f", "8c8d"]
+    # 各手番で合法な候補手（先手番/後手番）
+    black_candidates = [
+        {"move": "2g2f", "score_cp": 60, "rank": 1},
+        {"move": "9g9f", "score_cp": -50, "rank": 2},
+    ]
+    white_candidates = [
+        {"move": "8c8d", "score_cp": 40, "rank": 1},
+        {"move": "1c1d", "score_cp": -70, "rank": 2},
+    ]
+
+    lines = []
+    for game_id in range(3):
+        result = "black_win" if game_id % 2 == 0 else "white_win"
+        for ply in range(4):
+            moves = " ".join(moves_seq[:ply])
+            sfen = f"startpos moves {moves}".strip() if ply > 0 else "startpos"
+            score = (game_id + 1) * 30 * (1 if ply % 2 == 0 else -1)
+            candidates = black_candidates if ply % 2 == 0 else white_candidates
+            lines.append(json.dumps({
+                "sfen": sfen, "score_cp": score, "ply": ply,
+                "game_id": game_id, "result": result,
+                "candidates": candidates,
+            }))
+    path = tmp_path / "candidates_data.jsonl"
+    path.write_text("\n".join(lines))
+    return path
+
+
+class TestTrainRanking:
+    """ranking損失・一致率計測を有効にした学習テスト."""
+
+    def test_train_with_ranking(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """ranking損失付きで学習が完了し、検証メトリクスが記録される."""
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.5, ranking_min_gap=30.0,
+        )
+        train(config)
+
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu", weights_only=False
+        )
+        assert ckpt["config"]["ranking_weight"] == 0.5
+        # 検証対局にもcandidatesがあるためranking検証メトリクスが記録される
+        ranking_val = ckpt["state"]["ranking_val"]
+        assert len(ranking_val) == config.epochs
+        assert 0.0 <= ranking_val[0]["accuracy"] <= 1.0
+
+    def test_ranking_without_candidates_raises(
+        self, small_data: Path, tmp_path: Path
+    ) -> None:
+        """candidatesの無いデータでranking有効化は明示エラー."""
+        config = _small_config(
+            small_data, tmp_path / "ckpt", ranking_weight=0.5
+        )
+        with pytest.raises(ValueError, match="ranking"):
+            train(config)
+
+    def test_train_with_agreement(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """一致率計測付きで学習が完了し、履歴がcheckpoint・ログに残る."""
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            agreement_data=str(candidates_data),
+            agreement_limit=10,
+            save_every=2,  # epoch 2で定期保存＋計測
+        )
+        train(config)
+
+        import json
+
+        log_files = list((tmp_path / "ckpt").glob("log_*.json"))
+        assert len(log_files) == 1
+        log_data = json.loads(log_files[0].read_text())
+        # 定期保存時（epoch 2）と学習終了時の2回計測される
+        assert len(log_data["agreement"]) == 2
+        for entry in log_data["agreement"]:
+            assert 0.0 <= entry["agreement"] <= 1.0
+            assert 0.0 <= entry["multipv_hit_rate"] <= 1.0
+
+        # checkpointにも自身の計測結果まで含めて残る（計測後に再保存）
+        epoch_ckpt = torch.load(
+            tmp_path / "ckpt" / "epoch_0002.pt",
+            map_location="cpu", weights_only=False,
+        )
+        assert len(epoch_ckpt["state"]["agreement"]) == 1
+        assert epoch_ckpt["state"]["agreement"][0]["epoch"] == 2
+
+        final_ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt",
+            map_location="cpu", weights_only=False,
+        )
+        assert len(final_ckpt["state"]["agreement"]) == 2
+        assert final_ckpt["state"]["agreement"][-1]["final"] is True
+
+    def test_ranking_single_game_raises(self, tmp_path: Path) -> None:
+        """game_idが1対局のみのデータでranking有効化は明示エラー（リーク防止）."""
+        import json
+
+        candidates = [
+            {"move": "2g2f", "score_cp": 60, "rank": 1},
+            {"move": "9g9f", "score_cp": -50, "rank": 2},
+        ]
+        lines = [
+            json.dumps({
+                "sfen": "startpos", "score_cp": 50, "ply": 0,
+                "game_id": 0, "result": "black_win",
+                "candidates": candidates,
+            })
+            for _ in range(8)
+        ]
+        data_path = tmp_path / "single_game.jsonl"
+        data_path.write_text("\n".join(lines))
+
+        config = _small_config(data_path, tmp_path / "ckpt", ranking_weight=0.5)
+        with pytest.raises(ValueError, match="game_id"):
+            train(config)

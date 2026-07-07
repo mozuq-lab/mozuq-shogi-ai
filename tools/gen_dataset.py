@@ -35,10 +35,12 @@ class PositionRecord:
     game_id: int        # 対局ID
     result: Optional[str] = None  # 対局結果（"black_win", "white_win", "draw"）
     source: Optional[str] = None  # レコード由来（None=対局局面, "pv_leaf", "multipv"）
+    # MultiPV候補手のリスト（[{"move", "score_cp", "rank"}, ...]、手番側視点）
+    candidates: Optional[list[dict]] = None
 
 
 def record_to_dict(record: PositionRecord | dict) -> dict:
-    """レコードをJSONL書き込み用の辞書に変換（sourceがNoneなら省略）.
+    """レコードをJSONL書き込み用の辞書に変換（source/candidatesがNoneなら省略）.
 
     Args:
         record: PositionRecordまたは辞書
@@ -49,6 +51,8 @@ def record_to_dict(record: PositionRecord | dict) -> dict:
     d = asdict(record) if isinstance(record, PositionRecord) else dict(record)
     if d.get("source") is None:
         d.pop("source", None)
+    if d.get("candidates") is None:
+        d.pop("candidates", None)
     return d
 
 
@@ -121,11 +125,63 @@ def build_pv_leaf_record(
     )
 
 
+def get_legal_moves_usi(moves: list[str]) -> set[str]:
+    """現局面の合法手集合（USI形式）を取得.
+
+    Args:
+        moves: 現局面までの指し手リスト
+
+    Returns:
+        合法手のUSI表記の集合
+    """
+    board = shogi.Board()
+    for move_usi in moves:
+        board.push_usi(move_usi)
+    return {m.usi() for m in board.legal_moves}
+
+
+def build_candidates(
+    entries: list[MultiPVEntry],
+    legal_moves: Optional[set[str]] = None,
+) -> Optional[list[dict]]:
+    """MultiPV候補手リストを親局面レコード用に構築.
+
+    同一探索・同一深さの評価値なので候補手間の比較に使える。
+    ranking lossの学習ペアや、オフライン指し手一致率の教師として利用する。
+
+    Args:
+        entries: MultiPV候補のリスト
+        legal_moves: 現局面の合法手集合。指定時、非合法な候補手を除外する
+            （エンジンのMultiPV行はhash再構築で稀に壊れることがあるため）
+
+    Returns:
+        [{"move", "score_cp", "rank"}, ...]（rank昇順）。有効な候補が無ければNone
+    """
+    candidates: list[dict] = []
+    for entry in entries:
+        score = mate_to_cp(entry.score_cp, entry.score_mate)
+        if score is None:
+            continue
+        if legal_moves is not None and entry.move not in legal_moves:
+            continue
+        candidates.append({
+            "move": entry.move,
+            "score_cp": score,
+            "rank": entry.rank,
+        })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c["rank"])
+    return candidates
+
+
 def build_multipv_records(
     moves: list[str],
     ply: int,
     game_id: int,
     entries: list[MultiPVEntry],
+    legal_moves: Optional[set[str]] = None,
 ) -> list[PositionRecord]:
     """MultiPV候補手の子局面レコードを構築.
 
@@ -138,6 +194,7 @@ def build_multipv_records(
         ply: 現局面の手数
         game_id: 対局ID
         entries: MultiPV候補のリスト
+        legal_moves: 現局面の合法手集合。指定時、非合法な候補手を除外する
 
     Returns:
         子局面レコードのリスト
@@ -149,6 +206,9 @@ def build_multipv_records(
 
         score = mate_to_cp(entry.score_cp, entry.score_mate)
         if score is None:
+            continue
+
+        if legal_moves is not None and entry.move not in legal_moves:
             continue
 
         # entryのscoreは現局面の手番側視点。子局面は相手番なので符号反転
@@ -335,11 +395,22 @@ class SelfPlayGenerator:
                 # 注: 正確なSFENを取得するにはcshogiを使用するのがベスト
                 sfen = self._moves_to_sfen_approx(moves, ply)
 
+                # MultiPV有効時は候補手リストを親レコードに付与
+                # （壊れたMultiPV行の混入を防ぐため合法手のみ採用）
+                candidates: Optional[list[dict]] = None
+                multipv_legal: Optional[set[str]] = None
+                if self.multipv > 1 and search_result.multipv:
+                    multipv_legal = get_legal_moves_usi(moves)
+                    candidates = build_candidates(
+                        search_result.multipv, multipv_legal
+                    )
+
                 records.append(PositionRecord(
                     sfen=sfen,
                     score_cp=score_cp,
                     ply=ply,
                     game_id=game_id,
+                    candidates=candidates,
                 ))
 
                 # PV末端局面のレコードを追加
@@ -353,7 +424,8 @@ class SelfPlayGenerator:
                 # MultiPV候補手の子局面レコードを追加
                 if self.multipv > 1 and search_result.multipv:
                     records.extend(build_multipv_records(
-                        moves, ply, game_id, search_result.multipv
+                        moves, ply, game_id, search_result.multipv,
+                        multipv_legal,
                     ))
 
                 # 指し手を追加

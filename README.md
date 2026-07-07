@@ -9,7 +9,9 @@
 - **モデル構造オプション**: 玉相対位置埋め込み（NNUEのHalfKP相当）、2D位置埋め込み、持ち駒離散埋め込み
 - **柔軟な学習ターゲット**: tanh正規化 / 勝率空間（elmo式ブレンド）、EMA・Huber loss対応
 - **高密度データ生成**: PV末端局面・MultiPV候補手へのラベル付与で1対局あたり約4倍のデータ
-- **計測ツール**: 教師との指し手一致率、モデル同士の自己対局によるレート差測定
+- **Pairwise ranking学習**: MultiPV候補手ペアの優劣を補助損失として学習（Bonanza比較学習と同系統）
+- **計測ツール**: 教師との指し手一致率（エンジン不要のオフラインモード対応）、モデル同士の自己対局によるレート差測定
+- **学習中の自動計測**: checkpoint保存時に指し手一致率を自動計測し「val_lossは下がったが弱い」を早期検出
 - **勝敗補助損失**: 評価値予測と勝率予測のマルチタスク学習
 - **USIプロトコル対応**: 将棋GUIで対局可能
 
@@ -33,6 +35,8 @@ git submodule update --init --recursive
 python tools/gen_dataset.py -n 100 --depth 10 -o data/raw/dataset.jsonl
 
 # PV末端局面 + MultiPV候補手も記録（レコード数が約4倍に）
+# MultiPV 2以上では候補手リスト（candidates）も記録され、
+# ranking損失やオフライン一致率計測の教師として使える
 python tools/gen_dataset.py -n 100 --depth 10 --workers 4 \
     --record-pv-leaf --multipv 3 -o data/raw/dataset.jsonl
 
@@ -62,6 +66,12 @@ PYTHONPATH=. python train/train.py \
     --num-workers 4 \
     --epochs 100 \
     --batch-size 512
+
+# ranking損失 + 一致率自動計測付き（--multipv 2以上で生成したデータが必要）
+PYTHONPATH=. python train/train.py \
+    --data data/raw/dataset.jsonl \
+    --ranking-weight 0.3 \
+    --agreement-data data/raw/dataset.jsonl --agreement-limit 200
 ```
 
 モデル構造オプション（`--use-king-relative` / `--use-2d-pos` / `--use-discrete-hand`）や
@@ -75,6 +85,11 @@ PYTHONPATH=. python train/train.py \
 PYTHONPATH=. python scripts/move_agreement.py \
     --model checkpoints/best.pt --data data/raw/dataset.jsonl \
     --depth 10 --limit 300
+
+# オフラインモード（データのMultiPV記録を教師に、エンジン不要で高速）
+PYTHONPATH=. python scripts/move_agreement.py \
+    --model checkpoints/best.pt --data data/raw/dataset.jsonl \
+    --offline --limit 300
 
 # 新旧モデルの自己対局（勝率と推定レート差）
 PYTHONPATH=. python scripts/selfplay_match.py \
@@ -118,6 +133,8 @@ PYTHONPATH=. python engine/usi_server.py --model checkpoints/best.pt
 | `--ema-decay` | 0 | EMA減衰率（推奨: 0.999） |
 | `--target-mode` | cp | ターゲット空間（cp / wdl=勝率elmoブレンド） |
 | `--use-king-relative` | - | 玉相対位置埋め込み |
+| `--ranking-weight` | 0 | pairwise ranking損失の重み（要MultiPVデータ） |
+| `--agreement-data` | - | 指し手一致率の自動計測用データ（MultiPV記録付き） |
 
 ## ディレクトリ構成
 

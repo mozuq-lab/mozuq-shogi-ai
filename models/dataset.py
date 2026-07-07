@@ -149,6 +149,42 @@ def augment_horizontal_flip(
     return flip_board_horizontal(board), hand  # 持ち駒は変わらない
 
 
+def _stack_features(board: torch.Tensor) -> torch.Tensor:
+    """盤面から拡張特徴量テンソル (81, 10) を構築.
+
+    Args:
+        board: 盤面テンソル (81,)
+
+    Returns:
+        [attack(2), king_dist(2), piece_value(1), control(1), king_safety(4)]
+        を結合したテンソル (81, 10)
+    """
+    features = compute_all_features(board)
+    return torch.cat([
+        features["attack_map"],        # (81, 2)
+        features["king_distance"],     # (81, 2)
+        features["piece_value"].unsqueeze(1),  # (81, 1)
+        features["control"].unsqueeze(1),      # (81, 1)
+        features["king_safety"],       # (81, 4)
+    ], dim=1)
+
+
+def child_sfen(parent_sfen: str, move: str) -> str:
+    """親局面のsfenに指し手を1手追加した子局面のsfenを構築.
+
+    Args:
+        parent_sfen: 親局面（"startpos [moves ...]" または "sfen ... [moves ...]"）
+        move: 追加する指し手（USI形式）
+
+    Returns:
+        子局面のsfen文字列
+    """
+    parent = parent_sfen.strip()
+    if " moves " in parent:
+        return f"{parent} {move}"
+    return f"{parent} moves {move}"
+
+
 class ShogiValueDataset(Dataset):
     """将棋局面評価値データセット.
 
@@ -320,18 +356,171 @@ class ShogiValueDataset(Dataset):
 
         # 拡張特徴量を追加（変換後の盤面から計算）
         if self.use_features:
-            features = compute_all_features(board)
-            # (81, 10) のテンソルにまとめる
-            # [attack(2), king_dist(2), piece_value(1), control(1), king_safety(4)]
-            result["features"] = torch.cat([
-                features["attack_map"],        # (81, 2)
-                features["king_distance"],     # (81, 2)
-                features["piece_value"].unsqueeze(1),  # (81, 1)
-                features["control"].unsqueeze(1),      # (81, 1)
-                features["king_safety"],       # (81, 4)
-            ], dim=1)
+            result["features"] = _stack_features(board)
 
         return result
+
+
+class ShogiRankingPairDataset(Dataset):
+    """MultiPV候補手ペアのrankingデータセット.
+
+    candidatesフィールドを持つ親局面レコードから「手Aは手Bより良い」ペアを構築する。
+    各ペアの要素は候補手を1手適用した子局面（手番は親の相手側）。
+    candidatesの評価値は親の手番側視点なので、親にとって良い手ほど
+    子局面の手番側（相手）視点の評価値は低くなるべき、という関係を学習に使う。
+
+    Args:
+        data_path: JSONLデータファイルのパス（candidatesフィールド付き）
+        use_features: 拡張特徴量を使用するかどうか
+        normalize_turn: 後手番を先手視点に正規化（メインデータセットと揃えること）
+        augment_flip: 左右反転でペアを2倍に拡張
+        min_gap_cp: ペアとして採用する最小評価値差（cp）。
+            差が小さいペアはラベル自体がノイズなので除外する。
+        include_game_ids: 指定時、このgame_idの対局のみ使用（検証用）
+        exclude_game_ids: 指定時、このgame_idの対局を除外（訓練用）
+    """
+
+    def __init__(
+        self,
+        data_path: str | Path,
+        use_features: bool = False,
+        normalize_turn: bool = False,
+        augment_flip: bool = False,
+        min_gap_cp: float = 30.0,
+        include_game_ids: set[int] | None = None,
+        exclude_game_ids: set[int] | None = None,
+    ) -> None:
+        self.data_path = Path(data_path)
+        self.use_features = use_features
+        self.normalize_turn = normalize_turn
+        self.augment_flip = augment_flip
+        self.min_gap_cp = min_gap_cp
+        # (親局面sfen, 良い手, 悪い手)
+        self.pairs: list[tuple[str, str, str]] = []
+
+        self._load_pairs(include_game_ids, exclude_game_ids)
+
+    def _load_pairs(
+        self,
+        include_game_ids: set[int] | None,
+        exclude_game_ids: set[int] | None,
+    ) -> None:
+        """データファイルからペアを構築する."""
+        with open(self.data_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
+
+                candidates = sample.get("candidates")
+                if not candidates or len(candidates) < 2:
+                    continue
+
+                game_id = sample.get("game_id", 0)
+                if include_game_ids is not None and game_id not in include_game_ids:
+                    continue
+                if exclude_game_ids is not None and game_id in exclude_game_ids:
+                    continue
+
+                sfen = sample["sfen"]
+                for i in range(len(candidates)):
+                    for j in range(i + 1, len(candidates)):
+                        gap = candidates[i]["score_cp"] - candidates[j]["score_cp"]
+                        if abs(gap) < self.min_gap_cp:
+                            continue
+                        better, worse = (
+                            (candidates[i], candidates[j])
+                            if gap > 0
+                            else (candidates[j], candidates[i])
+                        )
+                        self.pairs.append((sfen, better["move"], worse["move"]))
+
+    def __len__(self) -> int:
+        base_len = len(self.pairs)
+        if self.augment_flip:
+            return base_len * 2
+        return base_len
+
+    def _prepare_position(
+        self, sfen: str, apply_flip: bool
+    ) -> dict[str, torch.Tensor]:
+        """1局面分のモデル入力を作成（メインデータセットと同じ変換を適用）."""
+        parsed = parse_sfen(sfen)
+        board = parsed.board
+        hand = parsed.hand
+        turn = parsed.turn
+
+        if self.normalize_turn:
+            # ダミーのラベルを渡して盤面のみ正規化
+            board, hand, turn, _, _ = normalize_to_black_view(
+                board, hand, turn, 0.0, 0.5
+            )
+
+        if apply_flip:
+            board, hand = augment_horizontal_flip(board, hand)
+
+        result = {"board": board, "hand": hand, "turn": turn}
+        if self.use_features:
+            result["features"] = _stack_features(board)
+        return result
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """指定インデックスのペアを取得.
+
+        Args:
+            idx: ペアインデックス
+
+        Returns:
+            dict with keys:
+                - board_a, hand_a, turn_a: 良い手の子局面（features_a も use_features時）
+                - board_b, hand_b, turn_b: 悪い手の子局面（features_b も use_features時）
+        """
+        apply_flip = False
+        if self.augment_flip:
+            base_len = len(self.pairs)
+            if idx >= base_len:
+                idx = idx - base_len
+                apply_flip = True
+
+        parent_sfen, move_better, move_worse = self.pairs[idx]
+
+        pos_a = self._prepare_position(child_sfen(parent_sfen, move_better), apply_flip)
+        pos_b = self._prepare_position(child_sfen(parent_sfen, move_worse), apply_flip)
+
+        result = {
+            "board_a": pos_a["board"],
+            "hand_a": pos_a["hand"],
+            "turn_a": pos_a["turn"],
+            "board_b": pos_b["board"],
+            "hand_b": pos_b["hand"],
+            "turn_b": pos_b["turn"],
+        }
+        if self.use_features:
+            result["features_a"] = pos_a["features"]
+            result["features_b"] = pos_b["features"]
+        return result
+
+
+def ranking_collate_fn(
+    batch: list[dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    """rankingペアのバッチをまとめる関数.
+
+    Args:
+        batch: ペアサンプルのリスト
+
+    Returns:
+        バッチ化されたテンソルの辞書
+    """
+    result = {
+        key: torch.stack([s[key] for s in batch])
+        for key in ("board_a", "hand_a", "turn_a", "board_b", "hand_b", "turn_b")
+    }
+    if "features_a" in batch[0]:
+        result["features_a"] = torch.stack([s["features_a"] for s in batch])
+        result["features_b"] = torch.stack([s["features_b"] for s in batch])
+    return result
 
 
 def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

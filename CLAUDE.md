@@ -134,6 +134,10 @@ python tools/gen_dataset.py -n 100 --weak-side alternate --weak-prob 0.3 --worke
 - `--multipv N`: 1回の探索で上位N手を取得し、順位2以下の手の子局面に評価値
   （符号反転済み）を付与。「良い手と悪い手の評価差」を効率的に収集できる。
   レコードには `"source": "multipv"` が付く。
+  さらに親局面レコードに候補手リスト `candidates`
+  （`[{"move", "score_cp", "rank"}, ...]`、手番側視点）が付与される。
+  これはranking損失（`train.py --ranking-weight`）とオフライン一致率
+  （`move_agreement.py --offline`）の教師として使う。
 - 両方有効にすると1対局あたりのレコード数が約4倍になる（depth 5, MultiPV 3実測）。
 
 **ランダム手生成方式の違い：**
@@ -180,6 +184,8 @@ python tools/gen_dataset.py -n 100 --weak-side alternate --weak-prob 0.3 --worke
 | `ply` | 手数 |
 | `game_id` | 対局ID |
 | `result` | 対局結果 (`black_win`, `white_win`, `draw`) |
+| `source` | レコード由来（省略=対局局面, `pv_leaf`, `multipv`） |
+| `candidates` | MultiPV候補手リスト（`--multipv` 2以上時、親局面のみ） |
 
 ### KIF形式変換スクリプト (`scripts/to_kif.py`)
 
@@ -295,6 +301,39 @@ PYTHONPATH=. python train/train.py --data data.jsonl --aux-loss-weight 0.2
 
 損失 = MSE(評価値) + weight × BCE(勝率)
 
+### Pairwise ranking損失
+
+candidatesフィールド付きデータ（`gen_dataset.py --multipv` 2以上で生成）を使い、
+同一親局面の候補手ペアについて「良い手を指した子局面の評価が悪い手より高くなる」
+関係を補助損失として学習する（Bonanzaの比較学習と同系統）。
+1手読みは子局面評価値のargmaxで手を選ぶため、候補手間の順序学習は
+手選びの精度に直結する。
+
+```bash
+PYTHONPATH=. python train/train.py --data data_mpv.jsonl --ranking-weight 0.3
+```
+
+- 損失 = softplus(v_better − v_worse)（RankNet形式。vは子局面の手番側視点なので
+  良い手側が小さくなるべき）
+- 評価値差が `--ranking-min-gap`（デフォルト30cp）未満のペアはノイズとして除外
+- 訓練/検証はメインデータと同じ対局単位分割を共有（リーク防止）
+- 検証時はペア正答率（pair_accuracy）をエポックごとにログ出力
+
+### オフライン指し手一致率の自動計測
+
+`--agreement-data` にcandidatesフィールド付きJSONLを指定すると、
+定期checkpoint保存時と学習終了時に、rank 1の手との一致率を
+エンジン起動なしで計測してログJSONに記録する（val_lossと強さの乖離を早期検出）。
+
+```bash
+PYTHONPATH=. python train/train.py \
+    --data data_mpv.jsonl \
+    --agreement-data data_mpv.jsonl --agreement-limit 200
+```
+
+計測はEvaluator（推論と同じ経路）を通すため、学習時と推論時の
+前処理の食い違いも検出できる。
+
 ### 推奨オプションを有効にした学習
 
 ```bash
@@ -382,6 +421,10 @@ PYTHONPATH=. python train/train.py \
 | `--use-king-relative` | - | 玉相対位置埋め込み（HalfKP相当の帰納バイアス） |
 | `--use-2d-pos` | - | 2D位置埋め込み（学習可能な段・筋埋め込み） |
 | `--use-discrete-hand` | - | 持ち駒枚数を離散埋め込みで表現 |
+| `--ranking-weight` | 0 | pairwise ranking損失の重み（0=無効、candidatesフィールド必須） |
+| `--ranking-min-gap` | 30 | rankingペアの最小評価値差（cp、これ未満はノイズとして除外） |
+| `--agreement-data` | なし | オフライン一致率計測用のcandidatesフィールド付きJSONL |
+| `--agreement-limit` | 200 | 一致率計測の局面数上限 |
 
 #### 評価値ターゲットの選択
 
@@ -484,7 +527,16 @@ PYTHONPATH=. python scripts/move_agreement.py \
     --model checkpoints/best.pt \
     --data data/raw/dataset.jsonl \
     --depth 10 --limit 200 --output reports/agreement.json
+
+# オフラインモード: candidatesフィールド（MultiPV記録）のrank 1を教師にする。
+# エンジン不要で高速。MultiPV上位手に入った率（MultiPV hit）も出力。
+PYTHONPATH=. python scripts/move_agreement.py \
+    --model checkpoints/best.pt \
+    --data data/raw/dataset_mpv.jsonl \
+    --offline --limit 200
 ```
+
+学習中の自動計測は `train.py --agreement-data` を参照。
 
 ### モデル同士の自己対局 (`scripts/selfplay_match.py`)
 
@@ -532,6 +584,17 @@ PYTHONPATH=. python scripts/selfplay_match.py \
 - [x] **左右反転データ拡張** - 対称性を活用
   - `train.py`: `--augment-flip`オプション
   - 効果: データを2倍に（normalize-turnと合わせて使用可能）
+
+- [x] **MultiPV候補手のcandidates記録** - ranking学習・オフライン一致率の教師
+  - `gen_dataset.py`: `--multipv` 2以上で親局面レコードに候補手リストを付与
+
+- [x] **Pairwise ranking損失** - 候補手間の優劣を直接学習（Bonanza比較学習と同系統）
+  - `train.py`: `--ranking-weight` / `--ranking-min-gap`オプション
+  - `models/dataset.py`: `ShogiRankingPairDataset`（対局単位分割をメインと共有）
+
+- [x] **オフライン指し手一致率の自動計測** - 「val_lossは下がったが弱い」の早期検出
+  - `scripts/move_agreement.py`: `--offline`モード（candidates教師、エンジン不要）
+  - `train.py`: `--agreement-data`で定期保存時と学習終了時に自動計測・ログ記録
 
 - [ ] **重み付き損失（nodes基準）** - 難しい局面を重視
   - `gen_dataset.py`: 探索ノード数をJSONLに保存（SearchResultに既存）

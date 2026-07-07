@@ -11,6 +11,13 @@ JSONLデータの各局面で、モデルの1手読みが選ぶ手と
         --data data/raw/dataset.jsonl \
         --depth 10 --limit 200
 
+    # オフラインモード: データのcandidates（MultiPV記録）を教師にする。
+    # エンジン不要で高速。--multipv 2以上で生成したデータが必要。
+    PYTHONPATH=. python scripts/move_agreement.py \
+        --model checkpoints/best.pt \
+        --data data/raw/dataset_mpv.jsonl \
+        --offline --limit 200
+
     # 結果をJSONに保存
     PYTHONPATH=. python scripts/move_agreement.py \
         --model checkpoints/best.pt --data data/raw/dataset.jsonl \
@@ -134,6 +141,98 @@ def summarize(results: list[tuple[int, bool]]) -> dict:
     return summary
 
 
+def load_candidate_samples(data_path: str | Path) -> list[dict]:
+    """candidatesフィールドを持つ局面レコードを読み込む（重複sfenは除外）.
+
+    Args:
+        data_path: JSONLデータのパス
+
+    Returns:
+        candidates付きレコードのリスト
+    """
+    samples: list[dict] = []
+    seen: set[str] = set()
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            sample = json.loads(line)
+            if not sample.get("candidates"):
+                continue
+            if sample["sfen"] in seen:
+                continue
+            seen.add(sample["sfen"])
+            samples.append(sample)
+    return samples
+
+
+def measure_agreement_offline(
+    evaluator: Evaluator,
+    data_path: str | Path,
+    limit: int | None = None,
+    seed: int = 42,
+) -> dict:
+    """データのcandidates（MultiPV記録）を教師としてオフラインで一致率を測定.
+
+    エンジンを起動しないため高速で、学習ループへの組み込みに適する。
+    教師の最善手はcandidatesのrank 1、加えてモデルの手がcandidatesの
+    いずれかに含まれる率（multipv_hit_rate）も測定する。
+
+    Args:
+        evaluator: 評価器（find_best_moveを持つオブジェクト）
+        data_path: candidatesフィールド付きJSONLデータのパス
+        limit: 測定局面数の上限（Noneで全局面）
+        seed: サンプリング用シード
+
+    Returns:
+        集計結果の辞書（agreement/ply帯別/multipv_hit_rate等）
+    """
+    samples = load_candidate_samples(data_path)
+
+    if not samples:
+        raise ValueError(
+            f"candidatesフィールドを持つ局面がありません: {data_path} "
+            "(--multipv 2以上で生成したデータが必要)"
+        )
+
+    if limit is not None and len(samples) > limit:
+        rng = random.Random(seed)
+        samples = rng.sample(samples, limit)
+
+    results: list[tuple[int, bool]] = []
+    hit_count = 0
+    skipped = 0
+
+    for sample in samples:
+        board = board_from_sfen_line(sample["sfen"])
+        legal_moves = list(board.legal_moves)
+        if len(legal_moves) <= 1:
+            # 選択の余地がない局面は測定対象外
+            skipped += 1
+            continue
+
+        candidates = sample["candidates"]
+        teacher_move = min(candidates, key=lambda c: c["rank"])["move"]
+        candidate_moves = {c["move"] for c in candidates}
+
+        model_move, _ = evaluator.find_best_move(board)
+
+        results.append((sample.get("ply", 0), model_move == teacher_move))
+        if model_move in candidate_moves:
+            hit_count += 1
+
+    summary = summarize(results)
+    summary["skipped"] = skipped
+    summary["multipv_hit"] = hit_count
+    summary["multipv_hit_rate"] = (
+        hit_count / summary["total"] if summary["total"] > 0 else 0.0
+    )
+    summary["mode"] = "offline"
+    summary["data"] = str(data_path)
+    return summary
+
+
 def measure_agreement(
     model_path: str,
     data_path: str,
@@ -236,23 +335,39 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto", help="推論デバイス")
     parser.add_argument("--seed", type=int, default=42, help="サンプリング用シード")
     parser.add_argument("--output", type=str, default=None, help="結果JSONの出力先")
+    parser.add_argument("--offline", action="store_true",
+                        help="データのcandidatesを教師にエンジン無しで測定")
     args = parser.parse_args()
 
-    summary = measure_agreement(
-        model_path=args.model,
-        data_path=args.data,
-        depth=args.depth,
-        limit=args.limit if args.limit > 0 else None,
-        engine_type=args.engine_type,
-        device=args.device,
-        seed=args.seed,
-    )
+    limit = args.limit if args.limit > 0 else None
 
-    print(f"\n=== 指し手一致率 (depth {summary['depth']}) ===")
+    if args.offline:
+        evaluator = Evaluator(args.model, device=args.device)
+        summary = measure_agreement_offline(
+            evaluator, args.data, limit=limit, seed=args.seed
+        )
+        summary["model"] = str(args.model)
+        header = "指し手一致率 (offline / MultiPV教師)"
+    else:
+        summary = measure_agreement(
+            model_path=args.model,
+            data_path=args.data,
+            depth=args.depth,
+            limit=limit,
+            engine_type=args.engine_type,
+            device=args.device,
+            seed=args.seed,
+        )
+        header = f"指し手一致率 (depth {summary['depth']})"
+
+    print(f"\n=== {header} ===")
     print(f"全体:     {summary['agreement']:.3f} ({summary['matched']}/{summary['total']})")
     for phase, label in [("opening", "序盤"), ("middlegame", "中盤"), ("endgame", "終盤")]:
         p = summary[phase]
         print(f"{label} :   {p['agreement']:.3f} ({p['matched']}/{p['total']})")
+    if "multipv_hit_rate" in summary:
+        print(f"MultiPV hit: {summary['multipv_hit_rate']:.3f} "
+              f"({summary['multipv_hit']}/{summary['total']})")
     print(f"スキップ: {summary['skipped']}")
 
     if args.output:

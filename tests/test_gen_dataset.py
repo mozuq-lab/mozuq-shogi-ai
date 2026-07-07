@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from shogi_utils.usi_engine import USIEngine
+from shogi_utils.usi_engine import MultiPVEntry, USIEngine
 from tools.gen_dataset import (
     PositionRecord,
+    build_candidates,
     build_multipv_records,
     build_pv_leaf_record,
+    get_legal_moves_usi,
     mate_to_cp,
     record_to_dict,
 )
@@ -172,6 +174,29 @@ class TestBuildMultipvRecords:
         assert records[0].score_cp == 30
         assert records[0].ply == 2
 
+    def test_illegal_move_filtered(self) -> None:
+        """legal_moves指定時、非合法な候補手の子局面レコードは作られない."""
+        records = build_multipv_records(
+            [], 0, 0, self._entries(), legal_moves={"2g2f"}
+        )
+        # rank 2の7g7f・rank 3の9g9fが非合法扱いで除外され、rank 1は元々除外
+        assert records == []
+
+
+class TestGetLegalMovesUsi:
+    """get_legal_moves_usiのテスト."""
+
+    def test_startpos(self) -> None:
+        legal = get_legal_moves_usi([])
+        assert "7g7f" in legal
+        assert "2g2f" in legal
+        assert len(legal) == 30  # 初期局面の合法手数
+
+    def test_after_moves(self) -> None:
+        legal = get_legal_moves_usi(["7g7f"])
+        assert "3c3d" in legal  # 後手の手番
+        assert "7g7f" not in legal
+
 
 class TestRecordToDict:
     """record_to_dictのテスト."""
@@ -194,3 +219,75 @@ class TestRecordToDict:
     def test_dict_input(self) -> None:
         d = record_to_dict({"sfen": "startpos", "score_cp": 1, "source": None})
         assert "source" not in d
+
+    def test_candidates_none_omitted(self) -> None:
+        record = PositionRecord(
+            sfen="startpos", score_cp=0, ply=0, game_id=0, result="draw"
+        )
+        d = record_to_dict(record)
+        assert "candidates" not in d
+
+    def test_candidates_kept(self) -> None:
+        candidates = [{"move": "2g2f", "score_cp": 50, "rank": 1}]
+        record = PositionRecord(
+            sfen="startpos", score_cp=50, ply=0, game_id=0,
+            candidates=candidates,
+        )
+        d = record_to_dict(record)
+        assert d["candidates"] == candidates
+
+
+class TestBuildCandidates:
+    """build_candidatesのテスト."""
+
+    def test_basic(self) -> None:
+        entries = [
+            MultiPVEntry(rank=2, move="7g7f", score_cp=30),
+            MultiPVEntry(rank=1, move="2g2f", score_cp=55),
+        ]
+        candidates = build_candidates(entries)
+        assert candidates == [
+            {"move": "2g2f", "score_cp": 55, "rank": 1},
+            {"move": "7g7f", "score_cp": 30, "rank": 2},
+        ]
+
+    def test_mate_converted(self) -> None:
+        entries = [
+            MultiPVEntry(rank=1, move="2g2f", score_mate=3),
+            MultiPVEntry(rank=2, move="7g7f", score_mate=-5),
+        ]
+        candidates = build_candidates(entries)
+        assert candidates[0]["score_cp"] == 30000
+        assert candidates[1]["score_cp"] == -30000
+
+    def test_no_score_entry_skipped(self) -> None:
+        entries = [
+            MultiPVEntry(rank=1, move="2g2f", score_cp=10),
+            MultiPVEntry(rank=2, move="7g7f"),  # スコアなし
+        ]
+        candidates = build_candidates(entries)
+        assert len(candidates) == 1
+        assert candidates[0]["move"] == "2g2f"
+
+    def test_empty_returns_none(self) -> None:
+        assert build_candidates([]) is None
+        assert build_candidates([MultiPVEntry(rank=1, move="2g2f")]) is None
+
+    def test_illegal_move_filtered(self) -> None:
+        """legal_moves指定時、非合法な候補手（壊れたMultiPV行）は除外される."""
+        entries = [
+            MultiPVEntry(rank=1, move="2g2f", score_cp=10),
+            MultiPVEntry(rank=2, move="2g2g", score_cp=5),  # 非合法
+        ]
+        candidates = build_candidates(entries, legal_moves={"2g2f", "7g7f"})
+        assert len(candidates) == 1
+        assert candidates[0]["move"] == "2g2f"
+
+    def test_no_legal_moves_keeps_all(self) -> None:
+        """legal_moves未指定なら従来どおりフィルタしない."""
+        entries = [
+            MultiPVEntry(rank=1, move="2g2f", score_cp=10),
+            MultiPVEntry(rank=2, move="2g2g", score_cp=5),
+        ]
+        candidates = build_candidates(entries)
+        assert len(candidates) == 2

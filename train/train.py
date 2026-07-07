@@ -30,7 +30,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader, Subset, random_split
 
-from models import ShogiValueDataset, ValueTransformer, collate_fn
+from models import (
+    ShogiRankingPairDataset,
+    ShogiValueDataset,
+    ValueTransformer,
+    collate_fn,
+    ranking_collate_fn,
+)
 
 if TYPE_CHECKING:
     pass
@@ -127,6 +133,19 @@ class TrainConfig:
     value_loss: str = "mse"
     huber_delta: float = 0.5
 
+    # Pairwise ranking損失（0=無効）
+    # candidatesフィールド付きデータ（gen_dataset.py --multipv 2以上）が必要。
+    # 同一親局面の候補手ペアについて「良い手の子局面の評価が悪い手より
+    # 高くなる（手番側視点では低くなる）」関係を学習する
+    ranking_weight: float = 0.0
+    ranking_min_gap: float = 30.0
+
+    # オフライン指し手一致率の計測（Noneで無効）
+    # candidatesフィールド付きJSONLを指定すると、定期checkpoint保存時と
+    # 学習終了時にrank1手との一致率を計測してログに記録する
+    agreement_data: str | None = None
+    agreement_limit: int = 200
+
 
 @dataclass
 class TrainState:
@@ -137,6 +156,10 @@ class TrainState:
     best_val_loss: float = float("inf")
     train_losses: list[float] = field(default_factory=list)
     val_losses: list[float] = field(default_factory=list)
+    # ranking検証メトリクス（epochごと: {"epoch", "loss", "accuracy"}）
+    ranking_val: list[dict] = field(default_factory=list)
+    # 指し手一致率の履歴（{"epoch", "agreement", ...}）
+    agreement: list[dict] = field(default_factory=list)
 
 
 def compute_value_loss(
@@ -163,6 +186,48 @@ def compute_value_loss(
     raise ValueError(f"Unknown value_loss: {loss_type}")
 
 
+def compute_ranking_loss(
+    value_better: torch.Tensor,
+    value_worse: torch.Tensor,
+) -> torch.Tensor:
+    """Pairwise ranking損失（RankNet形式）を計算.
+
+    ペアの各要素は「親局面で候補手を1手指した後の子局面」の評価値で、
+    子局面の手番側（=親の相手側）視点。親にとって良い手ほど子局面の
+    評価値は低くなるべきなので、value_better < value_worse を目指す。
+
+    loss = -log sigmoid(value_worse - value_better)
+         = softplus(value_better - value_worse)
+
+    Args:
+        value_better: 良い手の子局面の評価値 (batch,)
+        value_worse: 悪い手の子局面の評価値 (batch,)
+
+    Returns:
+        損失テンソル（スカラー）
+    """
+    return nn.functional.softplus(value_better - value_worse).mean()
+
+
+def _ranking_forward(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """rankingペアバッチを1回のforwardで評価し、(良い手側, 悪い手側)の値を返す."""
+    n = batch["board_a"].size(0)
+    board = torch.cat([batch["board_a"], batch["board_b"]]).to(device)
+    hand = torch.cat([batch["hand_a"], batch["hand_b"]]).to(device)
+    turn = torch.cat([batch["turn_a"], batch["turn_b"]]).to(device)
+    features = None
+    if "features_a" in batch:
+        features = torch.cat([batch["features_a"], batch["features_b"]]).to(device)
+
+    value, _ = model(board, hand, turn, features)
+    value = value.view(-1)
+    return value[:n], value[n:]
+
+
 def split_by_game(
     dataset: ShogiValueDataset,
     val_split: float,
@@ -186,9 +251,9 @@ def split_by_game(
         (訓練Subset, 検証Subset)
     """
     game_ids = [s.get("game_id", 0) for s in dataset.samples]
-    unique_games = sorted(set(game_ids))
+    val_games = select_val_games(game_ids, val_split, seed)
 
-    if len(unique_games) < 2:
+    if val_games is None:
         # game_idが無い/1対局のみの場合はランダム分割にフォールバック
         logger.warning(
             "game_idが不足しているためランダム分割にフォールバックします"
@@ -201,12 +266,6 @@ def split_by_game(
             generator=torch.Generator().manual_seed(seed),
         )
         return train_subset, val_subset
-
-    # 対局単位でシャッフルして分割
-    generator = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(len(unique_games), generator=generator).tolist()
-    n_val_games = max(1, int(len(unique_games) * val_split))
-    val_games = {unique_games[i] for i in perm[:n_val_games]}
 
     base_len = len(dataset.samples)
     train_indices: list[int] = []
@@ -222,11 +281,40 @@ def split_by_game(
         train_indices += [idx + base_len for idx in train_indices]
         val_indices += [idx + base_len for idx in val_indices]
 
+    n_games = len(set(game_ids))
     logger.info(
-        f"Game-level split: {len(unique_games) - n_val_games} games (train) / "
-        f"{n_val_games} games (val)"
+        f"Game-level split: {n_games - len(val_games)} games (train) / "
+        f"{len(val_games)} games (val)"
     )
     return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def select_val_games(
+    game_ids: list[int],
+    val_split: float,
+    seed: int = 42,
+) -> set[int] | None:
+    """検証に割り当てる対局IDの集合を決定する.
+
+    split_by_gameと同じseedで呼べば同じ分割が得られるため、
+    rankingペアデータセット等で同一の対局分割を共有できる。
+
+    Args:
+        game_ids: 各サンプルのgame_idのリスト
+        val_split: 検証データの割合
+        seed: 分割用シード
+
+    Returns:
+        検証用game_idの集合。対局数が2未満の場合None（ランダム分割にフォールバック）
+    """
+    unique_games = sorted(set(game_ids))
+    if len(unique_games) < 2:
+        return None
+
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(unique_games), generator=generator).tolist()
+    n_val_games = max(1, int(len(unique_games) * val_split))
+    return {unique_games[i] for i in perm[:n_val_games]}
 
 
 def get_device(device_str: str) -> torch.device:
@@ -320,11 +408,16 @@ def train_epoch(
     ema_model: AveragedModel | None = None,
     value_loss_type: str = "mse",
     huber_delta: float = 0.5,
+    ranking_loader: DataLoader | None = None,
+    ranking_weight: float = 0.0,
 ) -> float:
     """1エポック学習."""
     model.train()
     total_loss = 0.0
     num_batches = 0
+
+    # rankingペアはメインバッチ1回につき1バッチ消費（尽きたら周回）
+    ranking_iter = iter(ranking_loader) if ranking_loader is not None else None
 
     for batch in loader:
         board = batch["board"].to(device)
@@ -367,9 +460,24 @@ def train_epoch(
         # 出力の標準偏差が小さいとペナルティ（負の項なので最大化される）
         variance_reg = value.std()
 
+        # Pairwise ranking損失（候補手ペアの優劣を学習）
+        ranking_loss: torch.Tensor | None = None
+        if ranking_iter is not None:
+            try:
+                ranking_batch = next(ranking_iter)
+            except StopIteration:
+                ranking_iter = iter(ranking_loader)
+                ranking_batch = next(ranking_iter)
+            value_better, value_worse = _ranking_forward(
+                model, ranking_batch, device
+            )
+            ranking_loss = compute_ranking_loss(value_better, value_worse)
+
         # 合計損失
         # variance_regを引くことで、stdを大きく維持するインセンティブを与える
         loss = value_loss + aux_loss_weight * outcome_loss - variance_reg_weight * variance_reg
+        if ranking_loss is not None:
+            loss = loss + ranking_weight * ranking_loss
         loss.backward()
 
         # デバッグ: 勾配の確認
@@ -391,9 +499,14 @@ def train_epoch(
         state.global_step += 1
 
         if state.global_step % log_every == 0:
+            ranking_str = (
+                f", ranking={ranking_loss.item():.6f}"
+                if ranking_loss is not None else ""
+            )
             logger.info(
                 f"Step {state.global_step}: loss={loss.item():.6f} "
-                f"(value={value_loss.item():.6f}, outcome={outcome_loss.item():.6f}, var_reg={variance_reg.item():.4f})"
+                f"(value={value_loss.item():.6f}, outcome={outcome_loss.item():.6f}, "
+                f"var_reg={variance_reg.item():.4f}{ranking_str})"
             )
 
     return total_loss / num_batches
@@ -443,6 +556,70 @@ def validate(
     return total_loss / num_batches
 
 
+@torch.no_grad()
+def validate_ranking(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float]:
+    """rankingペアの検証（損失とペア正答率）.
+
+    ペア正答率は「良い手の子局面の評価値が悪い手より低い」割合で、
+    1手読みの手選びの正しさを直接反映する指標。
+
+    Args:
+        model: 評価するモデル
+        loader: rankingペアの検証ローダー
+        device: デバイス
+
+    Returns:
+        (ranking損失, ペア正答率)
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch in loader:
+        value_better, value_worse = _ranking_forward(model, batch, device)
+        loss = compute_ranking_loss(value_better, value_worse)
+        total_loss += loss.item() * value_better.size(0)
+        correct += (value_better < value_worse).sum().item()
+        total += value_better.size(0)
+
+    if total == 0:
+        return 0.0, 0.0
+    return total_loss / total, correct / total
+
+
+def run_offline_agreement(
+    checkpoint_path: Path,
+    data_path: str,
+    limit: int,
+    device: str,
+) -> dict:
+    """保存済みcheckpointでオフライン指し手一致率を計測.
+
+    Evaluator（推論と同じ経路）を通すことで、学習時と推論時の
+    前処理の食い違いも検出できる。
+
+    Args:
+        checkpoint_path: 計測対象のcheckpointパス
+        data_path: candidatesフィールド付きJSONLデータのパス
+        limit: 測定局面数の上限
+        device: 推論デバイス
+
+    Returns:
+        一致率の集計結果
+    """
+    # エンジン関連の依存を学習時のみ読み込む
+    from engine.evaluator import Evaluator
+    from scripts.move_agreement import measure_agreement_offline
+
+    evaluator = Evaluator(checkpoint_path, device=device)
+    return measure_agreement_offline(evaluator, data_path, limit=limit)
+
+
 def train(config: TrainConfig) -> None:
     """学習メイン処理."""
     # デバイス
@@ -471,6 +648,73 @@ def train(config: TrainConfig) -> None:
     # 訓練/検証分割（対局単位でリークを防ぐ）
     train_dataset, val_dataset = split_by_game(dataset, config.val_split)
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    # rankingペアデータセット（メインと同じ対局分割を共有してリークを防ぐ）
+    ranking_train_loader: DataLoader | None = None
+    ranking_val_loader: DataLoader | None = None
+    if config.ranking_weight > 0:
+        game_ids = [s.get("game_id", 0) for s in dataset.samples]
+        val_games = select_val_games(game_ids, config.val_split)
+        if val_games is None:
+            # 対局単位の分割を共有できないと、rankingペアだけが
+            # 検証局面を訓練に使うリークが起きるため明示エラーにする
+            raise ValueError(
+                "--ranking-weightにはgame_idが2対局以上あるデータが必要です"
+            )
+
+        ranking_train_dataset = ShogiRankingPairDataset(
+            config.data_path,
+            use_features=config.use_features,
+            normalize_turn=config.normalize_turn,
+            augment_flip=config.augment_flip,
+            min_gap_cp=config.ranking_min_gap,
+            exclude_game_ids=val_games,
+        )
+        if len(ranking_train_dataset) == 0:
+            raise ValueError(
+                "rankingペアが構築できません。--ranking-weightには"
+                "candidatesフィールド付きデータ（gen_dataset.py --multipv 2以上）"
+                "が必要です"
+            )
+
+        # ペアは1サンプル2局面なので、バッチサイズを半分にして
+        # 1ステップあたりのforward局面数をメインバッチと揃える
+        ranking_batch_size = max(1, config.batch_size // 2)
+        ranking_train_loader = DataLoader(
+            ranking_train_dataset,
+            batch_size=ranking_batch_size,
+            shuffle=True,
+            collate_fn=ranking_collate_fn,
+            num_workers=config.num_workers,
+            pin_memory=device.type == "cuda",
+            persistent_workers=config.num_workers > 0,
+        )
+
+        n_val_pairs = 0
+        if val_games is not None:
+            ranking_val_dataset = ShogiRankingPairDataset(
+                config.data_path,
+                use_features=config.use_features,
+                normalize_turn=config.normalize_turn,
+                augment_flip=False,
+                min_gap_cp=config.ranking_min_gap,
+                include_game_ids=val_games,
+            )
+            n_val_pairs = len(ranking_val_dataset)
+            if n_val_pairs > 0:
+                ranking_val_loader = DataLoader(
+                    ranking_val_dataset,
+                    batch_size=ranking_batch_size,
+                    shuffle=False,
+                    collate_fn=ranking_collate_fn,
+                    num_workers=config.num_workers,
+                    pin_memory=device.type == "cuda",
+                    persistent_workers=config.num_workers > 0,
+                )
+        logger.info(
+            f"Ranking pairs: train={len(ranking_train_dataset)}, "
+            f"val={n_val_pairs} (min_gap={config.ranking_min_gap}cp)"
+        )
 
     # データローダー
     train_loader = DataLoader(
@@ -571,6 +815,8 @@ def train(config: TrainConfig) -> None:
             ema_model=ema_model,
             value_loss_type=config.value_loss,
             huber_delta=config.huber_delta,
+            ranking_loader=ranking_train_loader,
+            ranking_weight=config.ranking_weight,
         )
         state.train_losses.append(train_loss)
 
@@ -584,6 +830,18 @@ def train(config: TrainConfig) -> None:
             huber_delta=config.huber_delta,
         )
         state.val_losses.append(val_loss)
+
+        # ranking検証（ペア正答率は1手読みの手選び精度の直接的な指標）
+        if ranking_val_loader is not None:
+            rank_loss, rank_acc = validate_ranking(
+                eval_model, ranking_val_loader, device
+            )
+            state.ranking_val.append(
+                {"epoch": epoch + 1, "loss": rank_loss, "accuracy": rank_acc}
+            )
+            logger.info(
+                f"Ranking val: loss={rank_loss:.6f}, pair_accuracy={rank_acc:.3f}"
+            )
 
         # スケジューラ更新（warmup後）
         if epoch >= config.warmup_epochs:
@@ -608,11 +866,31 @@ def train(config: TrainConfig) -> None:
 
         # 定期保存
         if (epoch + 1) % config.save_every == 0:
+            checkpoint_path = output_dir / f"epoch_{epoch + 1:04d}.pt"
             save_checkpoint(
-                output_dir / f"epoch_{epoch + 1:04d}.pt",
+                checkpoint_path,
                 model, optimizer, scheduler, config, state,
                 ema_model=ema_model,
             )
+
+            # 保存したcheckpointでオフライン指し手一致率を計測
+            if config.agreement_data:
+                result = run_offline_agreement(
+                    checkpoint_path, config.agreement_data,
+                    config.agreement_limit, config.device,
+                )
+                state.agreement.append({"epoch": epoch + 1, **result})
+                logger.info(
+                    f"Agreement (epoch {epoch + 1}): "
+                    f"{result['agreement']:.3f} "
+                    f"(multipv_hit={result['multipv_hit_rate']:.3f})"
+                )
+                # 計測結果を含めて保存し直す（checkpoint単体で一致率を参照可能に）
+                save_checkpoint(
+                    checkpoint_path,
+                    model, optimizer, scheduler, config, state,
+                    ema_model=ema_model,
+                )
 
         # ログ保存
         log_data = {
@@ -620,6 +898,8 @@ def train(config: TrainConfig) -> None:
             "train_losses": state.train_losses,
             "val_losses": state.val_losses,
             "best_val_loss": state.best_val_loss,
+            "ranking_val": state.ranking_val,
+            "agreement": state.agreement,
         }
         with open(log_path, "w") as f:
             json.dump(log_data, f, indent=2)
@@ -627,11 +907,43 @@ def train(config: TrainConfig) -> None:
     # 最終保存
     total_time = time.time() - start_time
     logger.info(f"Training completed in {total_time / 60:.1f} minutes")
+    final_path = output_dir / "final.pt"
     save_checkpoint(
-        output_dir / "final.pt",
+        final_path,
         model, optimizer, scheduler, config, state,
         ema_model=ema_model,
     )
+
+    # 最終モデルでオフライン指し手一致率を計測
+    if config.agreement_data:
+        result = run_offline_agreement(
+            final_path, config.agreement_data,
+            config.agreement_limit, config.device,
+        )
+        state.agreement.append({"epoch": config.epochs, "final": True, **result})
+        logger.info(
+            f"Agreement (final): {result['agreement']:.3f} "
+            f"(序盤={result['opening']['agreement']:.3f}, "
+            f"中盤={result['middlegame']['agreement']:.3f}, "
+            f"終盤={result['endgame']['agreement']:.3f}, "
+            f"multipv_hit={result['multipv_hit_rate']:.3f})"
+        )
+        # 計測結果を含めて保存し直す（checkpoint単体で一致率を参照可能に）
+        save_checkpoint(
+            final_path,
+            model, optimizer, scheduler, config, state,
+            ema_model=ema_model,
+        )
+        log_data = {
+            "config": vars(config),
+            "train_losses": state.train_losses,
+            "val_losses": state.val_losses,
+            "best_val_loss": state.best_val_loss,
+            "ranking_val": state.ranking_val,
+            "agreement": state.agreement,
+        }
+        with open(log_path, "w") as f:
+            json.dump(log_data, f, indent=2)
 
 
 def main() -> None:
@@ -703,6 +1015,18 @@ def main() -> None:
     parser.add_argument("--value-loss", type=str, default="mse", choices=["mse", "huber"], help="評価値損失の種類")
     parser.add_argument("--huber-delta", type=float, default=0.5, help="Huber lossの遷移点")
 
+    # Pairwise ranking損失
+    parser.add_argument("--ranking-weight", type=float, default=0.0,
+                        help="ranking損失の重み（0=無効。candidatesフィールド付きデータが必要）")
+    parser.add_argument("--ranking-min-gap", type=float, default=30.0,
+                        help="ペアとして採用する最小評価値差（cp）")
+
+    # オフライン指し手一致率
+    parser.add_argument("--agreement-data", type=str, default=None,
+                        help="一致率計測用のcandidatesフィールド付きJSONL（指定時、定期保存と学習終了時に計測）")
+    parser.add_argument("--agreement-limit", type=int, default=200,
+                        help="一致率計測の局面数上限")
+
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -745,6 +1069,10 @@ def main() -> None:
         ema_decay=args.ema_decay,
         value_loss=args.value_loss,
         huber_delta=args.huber_delta,
+        ranking_weight=args.ranking_weight,
+        ranking_min_gap=args.ranking_min_gap,
+        agreement_data=args.agreement_data,
+        agreement_limit=args.agreement_limit,
     )
 
     train(config)
