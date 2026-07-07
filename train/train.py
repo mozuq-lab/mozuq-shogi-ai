@@ -972,8 +972,10 @@ def train(config: TrainConfig) -> None:
         )
 
         # ベストモデル保存
+        best_updated = False
         if val_loss < state.best_val_loss:
             state.best_val_loss = val_loss
+            best_updated = True
             save_checkpoint(
                 output_dir / "best.pt",
                 model, optimizer, scheduler, config, state,
@@ -1007,6 +1009,14 @@ def train(config: TrainConfig) -> None:
                     model, optimizer, scheduler, config, state,
                     ema_model=ema_model,
                 )
+                # 同一epochでbest.ptも更新されていれば計測結果を反映
+                # （この時点では重みが同一なので再保存で問題ない）
+                if best_updated:
+                    save_checkpoint(
+                        output_dir / "best.pt",
+                        model, optimizer, scheduler, config, state,
+                        ema_model=ema_model,
+                    )
 
         # ログ保存
         write_log(log_path, config, state)
@@ -1041,6 +1051,32 @@ def train(config: TrainConfig) -> None:
             model, optimizer, scheduler, config, state,
             ema_model=ema_model,
         )
+
+        # best.pt（既定の推論・比較対象）も自身の重みで計測し、結果を書き戻す。
+        # 学習終了時のmodelはbestとは別の重みなのでsave_checkpointは使えず、
+        # checkpoint辞書のstateだけを更新して保存し直す
+        best_path = output_dir / "best.pt"
+        if best_path.exists():
+            best_result = run_offline_agreement(
+                best_path, config.agreement_data,
+                config.agreement_limit, config.device,
+            )
+            best_ckpt = torch.load(
+                best_path, map_location="cpu", weights_only=False
+            )
+            best_epoch = best_ckpt["state"].get("epoch", 0) + 1
+            entry = {"epoch": best_epoch, "best": True, **best_result}
+            state.agreement.append(entry)
+            best_agreement = list(best_ckpt["state"].get("agreement", []))
+            best_agreement.append(entry)
+            best_ckpt["state"]["agreement"] = best_agreement
+            torch.save(best_ckpt, best_path)
+            logger.info(
+                f"Agreement (best, epoch {best_epoch}): "
+                f"{best_result['agreement']:.3f} "
+                f"(multipv_hit={best_result['multipv_hit_rate']:.3f})"
+            )
+
         write_log(log_path, config, state)
 
 

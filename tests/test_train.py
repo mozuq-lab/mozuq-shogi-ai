@@ -228,8 +228,8 @@ class TestTrainRanking:
         log_files = list((tmp_path / "ckpt").glob("log_*.json"))
         assert len(log_files) == 1
         log_data = json.loads(log_files[0].read_text())
-        # 定期保存時（epoch 2）と学習終了時の2回計測される
-        assert len(log_data["agreement"]) == 2
+        # 定期保存時（epoch 2）・学習終了時・best.ptの3回計測される
+        assert len(log_data["agreement"]) == 3
         for entry in log_data["agreement"]:
             assert 0.0 <= entry["agreement"] <= 1.0
             assert 0.0 <= entry["multipv_hit_rate"] <= 1.0
@@ -246,8 +246,16 @@ class TestTrainRanking:
             tmp_path / "ckpt" / "final.pt",
             map_location="cpu", weights_only=False,
         )
-        assert len(final_ckpt["state"]["agreement"]) == 2
         assert final_ckpt["state"]["agreement"][-1]["final"] is True
+
+        # best.ptには自身の重みで計測した結果が書き戻される
+        best_ckpt = torch.load(
+            tmp_path / "ckpt" / "best.pt",
+            map_location="cpu", weights_only=False,
+        )
+        best_entries = best_ckpt["state"]["agreement"]
+        assert len(best_entries) >= 1
+        assert best_entries[-1]["best"] is True
 
     def test_ranking_single_game_raises(self, tmp_path: Path) -> None:
         """game_idが1対局のみのデータでranking有効化は明示エラー（リーク防止）."""
