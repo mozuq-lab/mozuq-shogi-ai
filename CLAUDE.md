@@ -295,7 +295,7 @@ PYTHONPATH=. python train/train.py --data data.jsonl --aux-loss-weight 0.2
 
 損失 = MSE(評価値) + weight × BCE(勝率)
 
-### 全ての改良を有効にした学習
+### 推奨オプションを有効にした学習
 
 ```bash
 PYTHONPATH=. python train/train.py \
@@ -305,14 +305,18 @@ PYTHONPATH=. python train/train.py \
     --normalize-turn \
     --augment-flip \
     --cp-noise 7.5 \
-    --cp-filter-threshold 1500 \
-    --drop-zero-cp \
+    --cp-clamp 2000 \
+    --value-loss huber \
+    --ema-decay 0.999 \
     --num-workers 4 \
     --epochs 100 \
     --batch-size 512
 ```
 
-※ `--drop-zero-cp` は旧方式（`--random-type engine`）で生成したデータを使う場合のみ必要。
+- `--drop-zero-cp` は旧方式（`--random-type engine`）で生成したデータを使う場合のみ追加。
+- `--cp-clamp` は `--cp-filter-threshold`（除外方式）の上位互換。併用時はfilter→clampの順に適用。
+- モデル構造オプション（`--use-king-relative` / `--use-2d-pos` / `--use-discrete-hand`）と
+  `--target-mode wdl` は、`scripts/move_agreement.py` で効果を測りながら1つずつ追加を推奨。
 
 #### 出力
 
