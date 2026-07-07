@@ -13,11 +13,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+# プロジェクトルートをパスに追加（PYTHONPATH指定なしでも実行可能に）
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn as nn
