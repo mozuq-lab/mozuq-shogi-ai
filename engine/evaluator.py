@@ -23,6 +23,9 @@ from models.dataset import normalize_to_black_view
 if TYPE_CHECKING:
     from models.sfen_parser import ParsedPosition
 
+# 詰みの確定評価値（gen_dataset.pyのmate_to_cpと同じスケール）
+MATE_SCORE = 30000
+
 
 class Evaluator:
     """局面評価器."""
@@ -216,6 +219,9 @@ class Evaluator:
     def find_best_move(self, board: shogi.Board) -> tuple[str, int]:
         """最善手を探索（1手読み、全候補を1バッチで評価）.
 
+        1手詰めが存在する場合はNN評価に依らずルールで確定し、
+        (詰ます手, +MATE_SCORE) を即座に返す。
+
         Args:
             board: 現在の局面
 
@@ -225,12 +231,15 @@ class Evaluator:
         legal_moves = list(board.legal_moves)
 
         if not legal_moves:
-            return "resign", -30000
+            return "resign", -MATE_SCORE
 
-        # 各合法手を適用した局面をパース
+        # 各合法手を適用した局面をパース（1手詰めがあれば確定評価で即返す）
         parsed_list: list[ParsedPosition] = []
         for move in legal_moves:
             board.push(move)
+            if board.is_checkmate():
+                board.pop()
+                return move.usi(), MATE_SCORE
             parsed_list.append(parse_sfen(self._board_to_sfen(board)))
             board.pop()
 
