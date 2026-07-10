@@ -301,6 +301,11 @@ PYTHONPATH=. python train/train.py --data data.jsonl --aux-loss-weight 0.2
 
 損失 = MSE(評価値) + weight × BCE(勝率)
 
+※ pv_leaf/multipv分岐局面には本譜の勝敗が当てはまらない（実際に進行した
+本譜の勝敗が一律コピーされている）ため、`source`フィールド付きレコードは
+勝敗損失から自動で除外される（outcome_weight=0）。`--target-mode wdl`でも
+分岐局面は勝敗をブレンドせず評価値勝率のみを使う。
+
 ### Pairwise ranking損失
 
 candidatesフィールド付きデータ（`gen_dataset.py --multipv` 2以上で生成）を使い、
@@ -510,6 +515,8 @@ best_move, score = evaluator.find_best_move(board)
 ### 制限事項
 
 - 現在は1手読みのみ（各合法手の評価値を比較）
+- 1手詰めはルールで確定評価（NN評価に依らず+30000で即選択）
+- 千日手・連続王手・入玉宣言の確定評価は未対応
 - 探索アルゴリズム（αβ等）は未実装
 
 ## 評価関数の計測
