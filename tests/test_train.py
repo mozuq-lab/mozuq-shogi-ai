@@ -279,3 +279,45 @@ class TestTrainRanking:
         config = _small_config(data_path, tmp_path / "ckpt", ranking_weight=0.5)
         with pytest.raises(ValueError, match="game_id"):
             train(config)
+
+
+class TestComputeOutcomeLoss:
+    """重み付き勝敗損失（source別マスク）のテスト."""
+
+    def test_all_ones_matches_plain_bce(self) -> None:
+        """全重み1.0なら通常のBCE平均と一致する."""
+        from train.train import compute_outcome_loss
+
+        pred = torch.tensor([[0.7], [0.3], [0.9]])
+        target = torch.tensor([[1.0], [0.0], [1.0]])
+        weight = torch.ones(3, 1)
+
+        expected = torch.nn.functional.binary_cross_entropy(pred, target)
+        actual = compute_outcome_loss(pred, target, weight)
+        assert actual.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_masked_sample_excluded(self) -> None:
+        """重み0のサンプルは損失に寄与しない."""
+        from train.train import compute_outcome_loss
+
+        pred = torch.tensor([[0.7], [0.01]])
+        target = torch.tensor([[1.0], [1.0]])
+        weight = torch.tensor([[1.0], [0.0]])
+
+        # 2番目（大きなBCEを持つ）が無視され、1番目のみのBCEになる
+        expected = torch.nn.functional.binary_cross_entropy(
+            pred[:1], target[:1]
+        )
+        actual = compute_outcome_loss(pred, target, weight)
+        assert actual.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_all_zero_weights_returns_zero(self) -> None:
+        """全重み0（バッチ全体が分岐局面）なら損失0."""
+        from train.train import compute_outcome_loss
+
+        pred = torch.tensor([[0.7], [0.3]])
+        target = torch.tensor([[1.0], [0.0]])
+        weight = torch.zeros(2, 1)
+
+        actual = compute_outcome_loss(pred, target, weight)
+        assert actual.item() == pytest.approx(0.0)

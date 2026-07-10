@@ -414,6 +414,59 @@ class TestShogiValueDataset:
         with pytest.raises(ValueError):
             ShogiValueDataset(sample_data_path, target_mode="invalid")
 
+    @pytest.fixture
+    def mixed_source_path(self, tmp_path: Path) -> Path:
+        """本譜局面とpv_leaf/multipv分岐局面が混在するデータ."""
+        data = [
+            '{"sfen": "startpos", "score_cp": 50, "ply": 0, "game_id": 0, "result": "black_win"}',
+            '{"sfen": "startpos moves 7g7f", "score_cp": -40, "ply": 1, "game_id": 0, "result": "black_win", "source": "pv_leaf"}',
+            '{"sfen": "startpos moves 2g2f", "score_cp": -60, "ply": 1, "game_id": 0, "result": "black_win", "source": "multipv"}',
+        ]
+        path = tmp_path / "mixed_source.jsonl"
+        path.write_text("\n".join(data))
+        return path
+
+    def test_outcome_weight_game_record(self, mixed_source_path: Path) -> None:
+        """本譜局面（sourceなし）はoutcome_weight=1.0."""
+        dataset = ShogiValueDataset(mixed_source_path)
+        sample = dataset[0]
+        assert "outcome_weight" in sample
+        assert sample["outcome_weight"].item() == pytest.approx(1.0)
+
+    def test_outcome_weight_source_record(self, mixed_source_path: Path) -> None:
+        """pv_leaf/multipv分岐局面は本譜勝敗が無効なのでoutcome_weight=0.0."""
+        dataset = ShogiValueDataset(mixed_source_path)
+        for i in (1, 2):
+            sample = dataset[i]
+            assert sample["outcome_weight"].item() == pytest.approx(0.0)
+
+    def test_wdl_source_record_ignores_result(self, mixed_source_path: Path) -> None:
+        """wdlモードでは分岐局面に本譜勝敗をブレンドせず評価値勝率のみ使う."""
+        wdl_scale = 600.0
+        dataset = ShogiValueDataset(
+            mixed_source_path,
+            target_mode="wdl",
+            wdl_scale=wdl_scale,
+            wdl_lambda=0.5,
+        )
+        # 分岐局面: λに関わらず評価値勝率のみ（λ=1相当）
+        for i in (1, 2):
+            raw = dataset.samples[i]
+            expected = 2.0 * cp_to_wdl(raw["score_cp"], wdl_scale) - 1.0
+            assert dataset[i]["value"].item() == pytest.approx(expected, abs=1e-6)
+        # 本譜局面: 従来どおりブレンド（ply=0は先手番、black_win→outcome=1.0）
+        raw = dataset.samples[0]
+        blended = 0.5 * cp_to_wdl(raw["score_cp"], wdl_scale) + 0.5 * 1.0
+        expected = 2.0 * blended - 1.0
+        assert dataset[0]["value"].item() == pytest.approx(expected, abs=1e-6)
+
+    def test_collate_outcome_weight(self, mixed_source_path: Path) -> None:
+        """collate_fnがoutcome_weightをバッチ化する."""
+        dataset = ShogiValueDataset(mixed_source_path)
+        collated = collate_fn([dataset[i] for i in range(3)])
+        assert collated["outcome_weight"].shape == (3,)
+        assert collated["outcome_weight"].tolist() == pytest.approx([1.0, 0.0, 0.0])
+
 
 class TestSplitByGame:
     """対局単位のtrain/val分割のテスト."""

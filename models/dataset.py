@@ -286,6 +286,8 @@ class ShogiValueDataset(Dataset):
                 - turn: 手番テンソル ()
                 - value: 正規化評価値テンソル ()
                 - outcome: 勝敗ラベル (1.0: 手番側勝ち, 0.0: 手番側負け, 0.5: 引き分け)
+                - outcome_weight: 勝敗損失の重み ()。本譜局面=1.0、
+                  pv_leaf/multipv分岐局面=0.0（本譜勝敗が当てはまらないため）
                 - features: 拡張特徴量テンソル (81, 10) [use_features=True時のみ]
         """
         # 左右反転拡張: 後半のインデックスは反転版
@@ -323,11 +325,18 @@ class ShogiValueDataset(Dataset):
         else:  # draw
             outcome = 0.5
 
+        # 分岐局面（pv_leaf/multipv）には本譜の勝敗が当てはまらないため、
+        # 勝敗ラベルを損失・ブレンドから除外する
+        has_real_outcome = sample.get("source") is None
+
         # 評価値ターゲットを計算
         if self.target_mode == "wdl":
             # elmo式: 教師評価値の勝率と実際の勝敗をブレンドし、[-1, 1]にマップ
             eval_wr = cp_to_wdl(score_cp, self.wdl_scale)
-            blended = self.wdl_lambda * eval_wr + (1.0 - self.wdl_lambda) * outcome
+            if has_real_outcome:
+                blended = self.wdl_lambda * eval_wr + (1.0 - self.wdl_lambda) * outcome
+            else:
+                blended = eval_wr
             value = 2.0 * blended - 1.0
         else:
             value = normalize_cp(score_cp, self.cp_scale)
@@ -352,6 +361,9 @@ class ShogiValueDataset(Dataset):
             "turn": turn,
             "value": torch.tensor(value, dtype=torch.float32),
             "outcome": torch.tensor(outcome, dtype=torch.float32),
+            "outcome_weight": torch.tensor(
+                1.0 if has_real_outcome else 0.0, dtype=torch.float32
+            ),
         }
 
         # 拡張特徴量を追加（変換後の盤面から計算）
@@ -538,6 +550,7 @@ def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         "turn": torch.stack([s["turn"] for s in batch]),
         "value": torch.stack([s["value"] for s in batch]),
         "outcome": torch.stack([s["outcome"] for s in batch]),
+        "outcome_weight": torch.stack([s["outcome_weight"] for s in batch]),
     }
 
     # 拡張特徴量がある場合

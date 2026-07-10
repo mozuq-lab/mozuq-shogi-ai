@@ -187,6 +187,31 @@ def compute_value_loss(
     raise ValueError(f"Unknown value_loss: {loss_type}")
 
 
+def compute_outcome_loss(
+    outcome: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """重み付き勝敗BCE損失を計算.
+
+    pv_leaf/multipvなどの分岐局面には本譜の勝敗が当てはまらないため、
+    outcome_weight=0として損失から除外する。
+
+    Args:
+        outcome: 勝率予測 (batch, 1)
+        target: 勝敗ターゲット (batch, 1)
+        weight: サンプル重み (batch, 1)。0のサンプルは損失に寄与しない
+
+    Returns:
+        重み付き平均BCE損失（有効サンプルが無ければ0）
+    """
+    bce = nn.functional.binary_cross_entropy(outcome, target, reduction="none")
+    total = weight.sum()
+    if total.item() == 0.0:
+        return bce.sum() * 0.0
+    return (bce * weight).sum() / total
+
+
 def compute_ranking_loss(
     value_better: torch.Tensor,
     value_worse: torch.Tensor,
@@ -426,6 +451,7 @@ def train_epoch(
         turn = batch["turn"].to(device)
         target_value = batch["value"].to(device).unsqueeze(1)
         target_outcome = batch["outcome"].to(device).unsqueeze(1)
+        outcome_weight = batch["outcome_weight"].to(device).unsqueeze(1)
         features = batch.get("features")
         if features is not None:
             features = features.to(device)
@@ -452,10 +478,12 @@ def train_epoch(
             value, target_value, value_loss_type, huber_delta
         )
 
-        # 勝敗損失（補助タスク、Label Smoothing適用）
+        # 勝敗損失（補助タスク、Label Smoothing適用、分岐局面は重み0で除外）
         outcome = outcome.view(-1, 1)
         smoothed_outcome = smoothed_outcome.view(-1, 1)
-        outcome_loss = nn.functional.binary_cross_entropy(outcome, smoothed_outcome)
+        outcome_loss = compute_outcome_loss(
+            outcome, smoothed_outcome, outcome_weight
+        )
 
         # 分散維持の正則化（定数出力への崩壊を防ぐ）
         # 出力の標準偏差が小さいとペナルティ（負の項なので最大化される）
@@ -534,6 +562,7 @@ def validate(
         turn = batch["turn"].to(device)
         target_value = batch["value"].to(device).unsqueeze(1)
         target_outcome = batch["outcome"].to(device).unsqueeze(1)
+        outcome_weight = batch["outcome_weight"].to(device).unsqueeze(1)
         features = batch.get("features")
         if features is not None:
             features = features.to(device)
@@ -545,8 +574,10 @@ def validate(
             value, target_value, value_loss_type, huber_delta
         )
 
-        # 勝敗損失（補助タスク）
-        outcome_loss = nn.functional.binary_cross_entropy(outcome, target_outcome)
+        # 勝敗損失（補助タスク、分岐局面は重み0で除外）
+        outcome_loss = compute_outcome_loss(
+            outcome, target_outcome, outcome_weight
+        )
 
         # 合計損失
         loss = value_loss + aux_loss_weight * outcome_loss
