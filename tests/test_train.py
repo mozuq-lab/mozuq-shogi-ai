@@ -145,6 +145,27 @@ class TestTrainWdl:
         assert ckpt["config"]["cp_clamp"] == 2000.0
 
 
+class TestComputeDeltaLoss:
+    """compute_delta_loss（ΔV差分回帰）のテスト."""
+
+    def test_zero_when_diff_matches_target(self) -> None:
+        from train.train import compute_delta_loss
+        value_a = torch.tensor([-0.3, 0.1])
+        value_b = torch.tensor([0.2, 0.3])
+        target = torch.tensor([-0.5, -0.2])
+        loss = compute_delta_loss(value_a, value_b, target)
+        assert loss.item() == pytest.approx(0.0, abs=1e-7)
+
+    def test_small_error_quadratic(self) -> None:
+        from train.train import compute_delta_loss
+        # 誤差0.2 < huber_delta=0.5 → 二乗領域: 0.5 * 0.2^2
+        value_a = torch.tensor([0.0])
+        value_b = torch.tensor([0.0])
+        target = torch.tensor([-0.2])
+        loss = compute_delta_loss(value_a, value_b, target, huber_delta=0.5)
+        assert loss.item() == pytest.approx(0.5 * 0.2**2, abs=1e-6)
+
+
 @pytest.fixture
 def candidates_data(tmp_path: Path) -> Path:
     """candidatesフィールド付きの小規模学習データを生成（3対局 × 4局面）."""
@@ -256,6 +277,26 @@ class TestTrainRanking:
         best_entries = best_ckpt["state"]["agreement"]
         assert len(best_entries) >= 1
         assert best_entries[-1]["best"] is True
+
+    def test_train_with_delta_loss(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """ΔV損失のみ（ranking無効）でも学習が完了しdelta_maeが記録される."""
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.0, delta_weight=0.3, ranking_min_gap=30.0,
+        )
+        train(config)
+
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu",
+            weights_only=False,
+        )
+        assert ckpt["config"]["delta_weight"] == 0.3
+        ranking_val = ckpt["state"]["ranking_val"]
+        assert len(ranking_val) == config.epochs
+        assert "delta_mae" in ranking_val[0]
+        assert ranking_val[0]["delta_mae"] >= 0.0
 
     def test_ranking_single_game_raises(self, tmp_path: Path) -> None:
         """game_idが1対局のみのデータでranking有効化は明示エラー（リーク防止）."""

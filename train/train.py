@@ -141,6 +141,11 @@ class TrainConfig:
     ranking_weight: float = 0.0
     ranking_min_gap: float = 30.0
 
+    # ΔV差分回帰損失（0=無効）
+    # candidatesペア（および--delta-dataの摂動ペア）の評価値差分を
+    # Huber回帰する。rankingが順序のみ学ぶのに対し差分量まで合わせる
+    delta_weight: float = 0.0
+
     # オフライン指し手一致率の計測（Noneで無効）
     # candidatesフィールド付きJSONLを指定すると、定期checkpoint保存時と
     # 学習終了時にrank1手との一致率を計測してログに記録する
@@ -233,6 +238,33 @@ def compute_ranking_loss(
         損失テンソル（スカラー）
     """
     return nn.functional.softplus(value_better - value_worse).mean()
+
+
+def compute_delta_loss(
+    value_a: torch.Tensor,
+    value_b: torch.Tensor,
+    delta_target: torch.Tensor,
+    huber_delta: float = 0.5,
+) -> torch.Tensor:
+    """ΔV（ペア間の評価値差分）のHuber損失を計算.
+
+    絶対値の一致ではなく「似た局面間の評価差」を教師差分に合わせる。
+    1手読みの手選びはargmaxで決まるため、差分方向の誤差が着手を
+    直接左右する。ラベルを完全に学習できれば差分も合うが、有限容量では
+    この損失が差分方向の誤差を優先的に抑える再重み付けとして働く。
+
+    Args:
+        value_a: ペアA側の評価値 (batch,)
+        value_b: ペアB側の評価値 (batch,)
+        delta_target: value_a − value_b の教師ターゲット (batch,)
+        huber_delta: Huber lossの遷移点
+
+    Returns:
+        損失テンソル（スカラー）
+    """
+    return nn.functional.huber_loss(
+        value_a - value_b, delta_target, delta=huber_delta
+    )
 
 
 def _ranking_forward(
@@ -436,6 +468,7 @@ def train_epoch(
     huber_delta: float = 0.5,
     ranking_loader: DataLoader | None = None,
     ranking_weight: float = 0.0,
+    delta_weight: float = 0.0,
 ) -> float:
     """1エポック学習."""
     model.train()
@@ -489,8 +522,9 @@ def train_epoch(
         # 出力の標準偏差が小さいとペナルティ（負の項なので最大化される）
         variance_reg = value.std()
 
-        # Pairwise ranking損失（候補手ペアの優劣を学習）
+        # Pairwise ranking損失 + ΔV差分回帰損失（同じforwardを共有）
         ranking_loss: torch.Tensor | None = None
+        delta_loss: torch.Tensor | None = None
         if ranking_iter is not None:
             try:
                 ranking_batch = next(ranking_iter)
@@ -500,13 +534,22 @@ def train_epoch(
             value_better, value_worse = _ranking_forward(
                 model, ranking_batch, device
             )
-            ranking_loss = compute_ranking_loss(value_better, value_worse)
+            if ranking_weight > 0:
+                ranking_loss = compute_ranking_loss(value_better, value_worse)
+            if delta_weight > 0 and "delta_target" in ranking_batch:
+                delta_loss = compute_delta_loss(
+                    value_better, value_worse,
+                    ranking_batch["delta_target"].to(device),
+                    huber_delta,
+                )
 
         # 合計損失
         # variance_regを引くことで、stdを大きく維持するインセンティブを与える
         loss = value_loss + aux_loss_weight * outcome_loss - variance_reg_weight * variance_reg
         if ranking_loss is not None:
             loss = loss + ranking_weight * ranking_loss
+        if delta_loss is not None:
+            loss = loss + delta_weight * delta_loss
         loss.backward()
 
         # デバッグ: 勾配の確認
@@ -532,10 +575,14 @@ def train_epoch(
                 f", ranking={ranking_loss.item():.6f}"
                 if ranking_loss is not None else ""
             )
+            delta_str = (
+                f", delta={delta_loss.item():.6f}"
+                if delta_loss is not None else ""
+            )
             logger.info(
                 f"Step {state.global_step}: loss={loss.item():.6f} "
                 f"(value={value_loss.item():.6f}, outcome={outcome_loss.item():.6f}, "
-                f"var_reg={variance_reg.item():.4f}{ranking_str})"
+                f"var_reg={variance_reg.item():.4f}{ranking_str}{delta_str})"
             )
 
     return total_loss / num_batches
@@ -593,11 +640,12 @@ def validate_ranking(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[float, float]:
-    """rankingペアの検証（損失とペア正答率）.
+) -> tuple[float, float, float]:
+    """rankingペアの検証（損失・ペア正答率・ΔV平均絶対誤差）.
 
     ペア正答率は「良い手の子局面の評価値が悪い手より低い」割合で、
-    1手読みの手選びの正しさを直接反映する指標。
+    1手読みの手選びの正しさを直接反映する指標。delta_maeは
+    差分量の予測誤差（ΔV回帰の検証指標）。
 
     Args:
         model: 評価するモデル
@@ -605,10 +653,11 @@ def validate_ranking(
         device: デバイス
 
     Returns:
-        (ranking損失, ペア正答率)
+        (ranking損失, ペア正答率, ΔV平均絶対誤差)
     """
     model.eval()
     total_loss = 0.0
+    total_delta_err = 0.0
     correct = 0
     total = 0
 
@@ -618,10 +667,15 @@ def validate_ranking(
         total_loss += loss.item() * value_better.size(0)
         correct += (value_better < value_worse).sum().item()
         total += value_better.size(0)
+        if "delta_target" in batch:
+            target = batch["delta_target"].to(device)
+            total_delta_err += (
+                (value_better - value_worse - target).abs().sum().item()
+            )
 
     if total == 0:
-        return 0.0, 0.0
-    return total_loss / total, correct / total
+        return 0.0, 0.0, 0.0
+    return total_loss / total, correct / total, total_delta_err / total
 
 
 def agreement_data_overlaps(data_path: str, agreement_data: str | None) -> bool:
@@ -781,9 +835,10 @@ def _build_ranking_loaders(
 ) -> tuple[DataLoader | None, DataLoader | None]:
     """rankingペアのtrain/val用DataLoaderを構築する.
 
-    config.ranking_weight <= 0の場合は(None, None)を返す。
-    メインデータセットと同じ対局分割（select_val_games）を共有することで、
-    rankingペアだけが検証局面を訓練に使うリークを防ぐ。
+    config.ranking_weight <= 0 かつ config.delta_weight <= 0の場合は
+    (None, None)を返す。メインデータセットと同じ対局分割
+    （select_val_games）を共有することで、rankingペアだけが検証局面を
+    訓練に使うリークを防ぐ。
 
     Args:
         config: 学習設定
@@ -792,13 +847,13 @@ def _build_ranking_loaders(
 
     Returns:
         (rankingペア訓練用DataLoader, rankingペア検証用DataLoader)。
-        ranking_weight <= 0の場合は(None, None)。
+        ranking_weight <= 0 かつ delta_weight <= 0の場合は(None, None)。
 
     Raises:
         ValueError: game_idが2対局以上ないため対局単位の分割を共有できない場合、
             またはrankingペアが1つも構築できない場合。
     """
-    if config.ranking_weight <= 0:
+    if config.ranking_weight <= 0 and config.delta_weight <= 0:
         return None, None
 
     game_ids = [s.get("game_id", 0) for s in dataset.samples]
@@ -807,7 +862,8 @@ def _build_ranking_loaders(
         # 対局単位の分割を共有できないと、rankingペアだけが
         # 検証局面を訓練に使うリークが起きるため明示エラーにする
         raise ValueError(
-            "--ranking-weightにはgame_idが2対局以上あるデータが必要です"
+            "--ranking-weight/--delta-weightには"
+            "game_idが2対局以上あるデータが必要です"
         )
 
     ranking_train_dataset = ShogiRankingPairDataset(
@@ -817,10 +873,13 @@ def _build_ranking_loaders(
         augment_flip=config.augment_flip,
         min_gap_cp=config.ranking_min_gap,
         exclude_game_ids=val_games,
+        cp_scale=config.cp_scale,
+        target_mode=config.target_mode,
+        wdl_scale=config.wdl_scale,
     )
     if len(ranking_train_dataset) == 0:
         raise ValueError(
-            "rankingペアが構築できません。--ranking-weightには"
+            "rankingペアが構築できません。--ranking-weight/--delta-weightには"
             "candidatesフィールド付きデータ（gen_dataset.py --multipv 2以上）"
             "が必要です"
         )
@@ -847,6 +906,9 @@ def _build_ranking_loaders(
             augment_flip=False,
             min_gap_cp=config.ranking_min_gap,
             include_game_ids=val_games,
+            cp_scale=config.cp_scale,
+            target_mode=config.target_mode,
+            wdl_scale=config.wdl_scale,
         )
         n_val_pairs = len(ranking_val_dataset)
         if n_val_pairs > 0:
@@ -991,6 +1053,7 @@ def train(config: TrainConfig) -> None:
             huber_delta=config.huber_delta,
             ranking_loader=ranking_train_loader,
             ranking_weight=config.ranking_weight,
+            delta_weight=config.delta_weight,
         )
         state.train_losses.append(train_loss)
 
@@ -1007,14 +1070,16 @@ def train(config: TrainConfig) -> None:
 
         # ranking検証（ペア正答率は1手読みの手選び精度の直接的な指標）
         if ranking_val_loader is not None:
-            rank_loss, rank_acc = validate_ranking(
+            rank_loss, rank_acc, delta_mae = validate_ranking(
                 eval_model, ranking_val_loader, device
             )
             state.ranking_val.append(
-                {"epoch": epoch + 1, "loss": rank_loss, "accuracy": rank_acc}
+                {"epoch": epoch + 1, "loss": rank_loss,
+                 "accuracy": rank_acc, "delta_mae": delta_mae}
             )
             logger.info(
-                f"Ranking val: loss={rank_loss:.6f}, pair_accuracy={rank_acc:.3f}"
+                f"Ranking val: loss={rank_loss:.6f}, "
+                f"pair_accuracy={rank_acc:.3f}, delta_mae={delta_mae:.4f}"
             )
 
         # スケジューラ更新（warmup後）
@@ -1215,6 +1280,8 @@ def main() -> None:
                         help="ranking損失の重み（0=無効。candidatesフィールド付きデータが必要）")
     parser.add_argument("--ranking-min-gap", type=float, default=30.0,
                         help="ペアとして採用する最小評価値差（cp）")
+    parser.add_argument("--delta-weight", type=float, default=0.0,
+                        help="ΔV差分回帰損失の重み（0=無効。candidatesペアの評価値差分を回帰）")
 
     # オフライン指し手一致率
     parser.add_argument("--agreement-data", type=str, default=None,
