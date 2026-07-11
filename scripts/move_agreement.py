@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -138,6 +139,58 @@ def summarize(results: list[tuple[int, bool]]) -> dict:
             ),
         }
 
+    return summary
+
+
+def summarize_regret(
+    records: list[tuple[int, float | None]],
+    clamp: float = 1000.0,
+) -> dict:
+    """cp regret記録を集計.
+
+    regretは「教師視点での最善手と選択手の評価差」（cp、≧0）。
+    一致率と違い同等手が複数ある局面のノイズを吸収できる。
+    モデルの選択手がcandidatesに無い局面は下限しか分からない（censored）
+    ため件数のみ数え、平均・中央値には含めない。詰みスコア（±30000）で
+    平均が壊れないよう、集計前にclampで丸める。
+
+    Args:
+        records: (ply, regret)のリスト。regret=Noneはcensored
+        clamp: 集計前にregretを丸める上限（cp）
+
+    Returns:
+        regret_mean_cp / regret_median_cp / regret_samples /
+        regret_censored / regret_clamp / regret_by_phase を含む辞書
+    """
+
+    def _stats(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        clamped = [min(v, clamp) for v in values]
+        return statistics.mean(clamped), statistics.median(clamped)
+
+    valid = [r for _, r in records if r is not None]
+    mean, median = _stats(valid)
+    summary: dict = {
+        "regret_mean_cp": mean,
+        "regret_median_cp": median,
+        "regret_samples": len(valid),
+        "regret_censored": sum(1 for _, r in records if r is None),
+        "regret_clamp": clamp,
+    }
+
+    by_phase: dict = {}
+    for phase, (lo, hi) in PHASE_BOUNDS.items():
+        phase_records = [(ply, r) for ply, r in records if lo <= ply <= hi]
+        phase_valid = [r for _, r in phase_records if r is not None]
+        p_mean, p_median = _stats(phase_valid)
+        by_phase[phase] = {
+            "mean_cp": p_mean,
+            "median_cp": p_median,
+            "samples": len(phase_valid),
+            "censored": sum(1 for _, r in phase_records if r is None),
+        }
+    summary["regret_by_phase"] = by_phase
     return summary
 
 

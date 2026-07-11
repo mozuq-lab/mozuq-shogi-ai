@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import random
 
+import pytest
 import shogi
 
 from scripts.move_agreement import (
     board_from_sfen_line,
     engine_position_args,
     summarize,
+    summarize_regret,
 )
 from scripts.selfplay_match import elo_diff, play_game, random_opening
 
@@ -85,6 +87,40 @@ class TestSummarize:
         assert summary["middlegame"]["matched"] == 2
         assert summary["endgame"]["total"] == 2
         assert summary["endgame"]["agreement"] == 0.5
+
+
+class TestSummarizeRegret:
+    """summarize_regret（cp regret集計）のテスト."""
+
+    def test_mean_median_and_censored(self) -> None:
+        # (ply, regret)。Noneはcensored（モデルの手が候補外で下限しか不明）
+        records = [(0, 0.0), (10, 100.0), (40, 200.0), (90, None)]
+        summary = summarize_regret(records, clamp=1000.0)
+        assert summary["regret_mean_cp"] == pytest.approx(100.0)
+        assert summary["regret_median_cp"] == pytest.approx(100.0)
+        assert summary["regret_samples"] == 3
+        assert summary["regret_censored"] == 1
+
+    def test_clamp_applied(self) -> None:
+        # 詰みスコア由来の巨大regretはclampで丸めてから平均する
+        records = [(0, 30000.0), (0, 0.0)]
+        summary = summarize_regret(records, clamp=1000.0)
+        assert summary["regret_mean_cp"] == pytest.approx(500.0)
+
+    def test_phase_breakdown(self) -> None:
+        records = [(0, 100.0), (40, 300.0), (90, None)]
+        summary = summarize_regret(records, clamp=1000.0)
+        by_phase = summary["regret_by_phase"]
+        assert by_phase["opening"]["mean_cp"] == pytest.approx(100.0)
+        assert by_phase["middlegame"]["mean_cp"] == pytest.approx(300.0)
+        assert by_phase["endgame"]["censored"] == 1
+        assert by_phase["endgame"]["samples"] == 0
+
+    def test_empty(self) -> None:
+        summary = summarize_regret([], clamp=1000.0)
+        assert summary["regret_mean_cp"] == 0.0
+        assert summary["regret_samples"] == 0
+        assert summary["regret_censored"] == 0
 
 
 def _random_move_fn(rng: random.Random):
