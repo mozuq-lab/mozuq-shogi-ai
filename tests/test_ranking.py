@@ -84,8 +84,9 @@ class TestShogiRankingPairDataset:
 
     def test_better_move_comes_first(self, ranking_data: Path) -> None:
         dataset = ShogiRankingPairDataset(ranking_data, min_gap_cp=30.0)
-        assert ("startpos", "2g2f", "9g9f") in dataset.pairs
-        assert ("startpos moves 2g2f", "8c8d", "3c3d") in dataset.pairs
+        triples = {p[:3] for p in dataset.pairs}
+        assert ("startpos", "2g2f", "9g9f") in triples
+        assert ("startpos moves 2g2f", "8c8d", "3c3d") in triples
 
     def test_min_gap_zero_includes_all_pairs(self, ranking_data: Path) -> None:
         dataset = ShogiRankingPairDataset(ranking_data, min_gap_cp=0.0)
@@ -146,6 +147,53 @@ class TestShogiRankingPairDataset:
         assert batch["board_a"].shape == (2, 81)
         assert batch["board_b"].shape == (2, 81)
         assert batch["turn_a"].shape == (2,)
+
+
+class TestDeltaTarget:
+    """delta_target（ΔV回帰ターゲット）のテスト."""
+
+    def _pair_index(
+        self, dataset: ShogiRankingPairDataset, triple: tuple[str, str, str]
+    ) -> int:
+        return next(
+            i for i, p in enumerate(dataset.pairs) if p[:3] == triple
+        )
+
+    def test_cp_mode_value(self, ranking_data: Path) -> None:
+        # (2g2f: +50, 9g9f: -80) → n(−50) − n(+80)、n=tanh(cp/1200)
+        dataset = ShogiRankingPairDataset(
+            ranking_data, min_gap_cp=30.0, cp_scale=1200.0
+        )
+        idx = self._pair_index(dataset, ("startpos", "2g2f", "9g9f"))
+        expected = math.tanh(-50 / 1200.0) - math.tanh(80 / 1200.0)
+        assert dataset[idx]["delta_target"].item() == pytest.approx(
+            expected, abs=1e-6
+        )
+
+    def test_delta_negative_for_all_pairs(self, ranking_data: Path) -> None:
+        # 良い手側の子局面ターゲットは常に小さい（相手番視点）
+        dataset = ShogiRankingPairDataset(ranking_data, min_gap_cp=30.0)
+        for i in range(len(dataset)):
+            assert dataset[i]["delta_target"].item() < 0
+
+    def test_wdl_mode_value(self, ranking_data: Path) -> None:
+        dataset = ShogiRankingPairDataset(
+            ranking_data, min_gap_cp=30.0, target_mode="wdl", wdl_scale=600.0
+        )
+        idx = self._pair_index(dataset, ("startpos", "2g2f", "9g9f"))
+
+        def n(cp: float) -> float:
+            return 2.0 / (1.0 + math.exp(-cp / 600.0)) - 1.0
+
+        expected = n(-50.0) - n(80.0)
+        assert dataset[idx]["delta_target"].item() == pytest.approx(
+            expected, abs=1e-6
+        )
+
+    def test_collate_includes_delta_target(self, ranking_data: Path) -> None:
+        dataset = ShogiRankingPairDataset(ranking_data, min_gap_cp=30.0)
+        batch = ranking_collate_fn([dataset[0], dataset[1]])
+        assert batch["delta_target"].shape == (2,)
 
 
 class TestComputeRankingLoss:

@@ -8,6 +8,7 @@ from models.dataset import (
     collate_fn,
     ranking_collate_fn,
     stack_features,
+    value_target_from_cp,
 )
 from models.features import compute_all_features, compute_attack_map, compute_king_safety
 from models.sfen_parser import ParsedPosition, parse_sfen
@@ -26,6 +27,7 @@ __all__ = [
     "collate_fn",
     "ranking_collate_fn",
     "stack_features",
+    "value_target_from_cp",
     "ParsedPosition",
     "parse_sfen",
     "normalize_cp",

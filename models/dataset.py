@@ -185,6 +185,31 @@ def child_sfen(parent_sfen: str, move: str) -> str:
     return f"{parent} moves {move}"
 
 
+def value_target_from_cp(
+    score_cp: float,
+    target_mode: str = "cp",
+    cp_scale: float = 1200.0,
+    wdl_scale: float = 600.0,
+) -> float:
+    """score_cp（手番側視点）をモデルの値ターゲット空間へ変換.
+
+    ShogiValueDatasetのtarget_mode変換（勝敗ブレンドなしの分岐局面と
+    同じ規約）をペアデータセットでも使えるよう関数化したもの。
+
+    Args:
+        score_cp: 評価値（cp、その局面の手番側視点）
+        target_mode: "cp"（tanh正規化）または "wdl"（勝率を[-1,1]にマップ）
+        cp_scale: cpモードの正規化スケール
+        wdl_scale: wdlモードのシグモイドスケール
+
+    Returns:
+        [-1, 1]の値ターゲット
+    """
+    if target_mode == "wdl":
+        return 2.0 * cp_to_wdl(score_cp, wdl_scale) - 1.0
+    return normalize_cp(score_cp, cp_scale)
+
+
 class ShogiValueDataset(Dataset):
     """将棋局面評価値データセット.
 
@@ -390,6 +415,9 @@ class ShogiRankingPairDataset(Dataset):
             差が小さいペアはラベル自体がノイズなので除外する。
         include_game_ids: 指定時、このgame_idの対局のみ使用（検証用）
         exclude_game_ids: 指定時、このgame_idの対局を除外（訓練用）
+        cp_scale: delta_target計算（cpモード）の正規化スケール
+        target_mode: delta_targetの値空間（"cp"または"wdl"）
+        wdl_scale: delta_target計算（wdlモード）のシグモイドスケール
     """
 
     def __init__(
@@ -401,14 +429,22 @@ class ShogiRankingPairDataset(Dataset):
         min_gap_cp: float = 30.0,
         include_game_ids: set[int] | None = None,
         exclude_game_ids: set[int] | None = None,
+        cp_scale: float = 1200.0,
+        target_mode: str = "cp",
+        wdl_scale: float = 600.0,
     ) -> None:
+        if target_mode not in ("cp", "wdl"):
+            raise ValueError(f"Unknown target_mode: {target_mode}")
         self.data_path = Path(data_path)
         self.use_features = use_features
         self.normalize_turn = normalize_turn
         self.augment_flip = augment_flip
         self.min_gap_cp = min_gap_cp
-        # (親局面sfen, 良い手, 悪い手)
-        self.pairs: list[tuple[str, str, str]] = []
+        self.cp_scale = cp_scale
+        self.target_mode = target_mode
+        self.wdl_scale = wdl_scale
+        # (親局面sfen, 良い手, 悪い手, 良い手のscore_cp, 悪い手のscore_cp)
+        self.pairs: list[tuple[str, str, str, float, float]] = []
 
         self._load_pairs(include_game_ids, exclude_game_ids)
 
@@ -446,7 +482,10 @@ class ShogiRankingPairDataset(Dataset):
                             if gap > 0
                             else (candidates[j], candidates[i])
                         )
-                        self.pairs.append((sfen, better["move"], worse["move"]))
+                        self.pairs.append((
+                            sfen, better["move"], worse["move"],
+                            float(better["score_cp"]), float(worse["score_cp"]),
+                        ))
 
     def __len__(self) -> int:
         base_len = len(self.pairs)
@@ -487,6 +526,7 @@ class ShogiRankingPairDataset(Dataset):
             dict with keys:
                 - board_a, hand_a, turn_a: 良い手の子局面（features_a も use_features時）
                 - board_b, hand_b, turn_b: 悪い手の子局面（features_b も use_features時）
+                - delta_target: ΔV回帰ターゲット（スカラー、常に負値）
         """
         apply_flip = False
         if self.augment_flip:
@@ -495,7 +535,9 @@ class ShogiRankingPairDataset(Dataset):
                 idx = idx - base_len
                 apply_flip = True
 
-        parent_sfen, move_better, move_worse = self.pairs[idx]
+        parent_sfen, move_better, move_worse, score_better, score_worse = (
+            self.pairs[idx]
+        )
 
         pos_a = self._prepare_position(child_sfen(parent_sfen, move_better), apply_flip)
         pos_b = self._prepare_position(child_sfen(parent_sfen, move_worse), apply_flip)
@@ -508,6 +550,16 @@ class ShogiRankingPairDataset(Dataset):
             "hand_b": pos_b["hand"],
             "turn_b": pos_b["turn"],
         }
+
+        # ΔV回帰ターゲット。scoreは親の手番側視点なので、子局面の
+        # 値ターゲットは手番反転でn(−s)。良い手側が小さくなる（負値）
+        delta = value_target_from_cp(
+            -score_better, self.target_mode, self.cp_scale, self.wdl_scale
+        ) - value_target_from_cp(
+            -score_worse, self.target_mode, self.cp_scale, self.wdl_scale
+        )
+        result["delta_target"] = torch.tensor(delta, dtype=torch.float32)
+
         if self.use_features:
             result["features_a"] = pos_a["features"]
             result["features_b"] = pos_b["features"]
@@ -529,6 +581,10 @@ def ranking_collate_fn(
         key: torch.stack([s[key] for s in batch])
         for key in ("board_a", "hand_a", "turn_a", "board_b", "hand_b", "turn_b")
     }
+    if "delta_target" in batch[0]:
+        result["delta_target"] = torch.stack(
+            [s["delta_target"] for s in batch]
+        )
     if "features_a" in batch[0]:
         result["features_a"] = torch.stack([s["features_a"] for s in batch])
         result["features_b"] = torch.stack([s["features_b"] for s in batch])
