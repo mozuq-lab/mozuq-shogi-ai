@@ -2380,5 +2380,40 @@ python train/train.py --data <train.jsonl> --agreement-data <holdout.jsonl> \
     --output-dir checkpoints/delta1b
 ```
 
-判定は holdout の `regret_mean_cp`（主指標）・`agreement`・
-`selfplay_match.py` の対局結果で行う（設計書「Phase 1 の判定基準」参照）。
+### 学習完了後の判定手順
+
+1. **自動計測の確認**: 各構成の `checkpoints/<構成名>/log_*.json` の
+   `agreement` 配列に holdout での regret/一致率がエポック推移込みで
+   記録されている。val_loss は下がるのに regret が悪化していないかを見る。
+2. **best.pt の本計測**（3構成とも同一の holdout・`--limit`・シードで）:
+
+   ```bash
+   python scripts/move_agreement.py --model checkpoints/baseline/best.pt \
+       --data data/raw/holdout_mpv.jsonl --offline --limit 500 \
+       --output reports/baseline_agreement.json
+   # delta1a / delta1b も --model と --output だけ変えて同様に
+   ```
+
+   見る指標: `regret_mean_cp`（主指標、小さいほど良い）、`agreement`（参考）、
+   `multipv_hit_rate`、`regret_censored`（多すぎる場合は regret の信頼性低下）。
+3. **自己対局で裏取り**:
+
+   ```bash
+   python scripts/selfplay_match.py --model-a checkpoints/delta1a/best.pt \
+       --model-b checkpoints/baseline/best.pt --games 20 \
+       --output reports/match_1a_vs_base.json
+   # delta1b vs baseline も同様に
+   ```
+
+   20局では勝率が±10%程度ブレるため、regret を主判定とし自己対局は
+   「矛盾していないかの確認」に使う。時間が許せば50局以上。
+
+### 採否判定の基準
+
+- delta1a の regret が baseline より明確に小さく（数cpはノイズの可能性
+  あり。目安: 相対5〜10%以上の改善）、自己対局で負け越していない → 採用
+- 同様に delta1b の追加効果を判定
+- regret は改善したのに自己対局で明確に負ける場合は要調査
+  （計測条件の食い違いか、regret が捉えていない弱点のサイン）
+- 効果ゼロなら `--delta-weight` を 0.1〜0.5 の範囲で1〜2回調整してから
+  見切る。効果確認後は Phase 2（ハードネガティブ）へ進む
