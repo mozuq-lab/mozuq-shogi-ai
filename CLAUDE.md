@@ -381,7 +381,6 @@ PYTHONPATH=. python train/train.py \
     --cp-clamp 2000 \
     --value-loss huber \
     --ema-decay 0.999 \
-    --num-workers 4 \
     --epochs 100 \
     --batch-size 512
 ```
@@ -440,6 +439,7 @@ PYTHONPATH=. python train/train.py \
 | `--output-dir` | checkpoints | 出力ディレクトリ |
 | `--resume` | - | 再開するチェックポイント |
 | `--val-split` | 0.1 | 検証データ割合（対局単位で分割） |
+| `--num-workers` | 0 | データローダーのワーカー数（事前テンソル化により通常は0で十分） |
 | `--use-features` | - | 拡張特徴量を使用 |
 | `--aux-loss-weight` | 0.1 | 勝敗補助損失の重み |
 | `--drop-zero-cp` | - | score_cp==0の局面を除外（旧方式データのダミーラベル対策） |
@@ -480,6 +480,14 @@ checkpoints/
 ├── final.pt          # 最終モデル
 └── log_YYYYMMDD_HHMMSS.json  # 学習ログ
 ```
+
+### データの事前テンソル化
+
+データセットはロード時に全局面をテンソル化して保持する（同一対局の
+局面は差分適用で高速に構築）。`__getitem__`はインデックス参照のみになり、
+2エポック目以降のデータ供給がボトルネックにならない。
+メモリ目安: 20万局面 + `--use-features` + `--augment-flip` で約1.3GB。
+`--cp-noise`のノイズは従来どおり毎エポック新しく付与される。
 
 ### ハイパーパラメータ
 

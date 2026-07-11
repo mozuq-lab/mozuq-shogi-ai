@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.utils.data import Dataset
 
-from models.sfen_parser import parse_sfen
+from models.sfen_parser import ParsedPosition, apply_move, parse_sfen
 from models.value_transformer import cp_to_wdl, normalize_cp
 from models.features import compute_all_features
 
@@ -169,6 +169,52 @@ def stack_features(board: torch.Tensor) -> torch.Tensor:
     ], dim=1)
 
 
+def parse_positions_incremental(sfens: list[str]) -> list[ParsedPosition]:
+    """sfen列を接頭辞キャッシュ付きで一括パース.
+
+    "X moves m1 ... mk" の親 "X moves m1 ... m(k-1)"（k=1 のときは "X"）が
+    パース済みなら、盤面をcloneして末尾1手だけ適用する。O(全手数の総和)
+    だった構築コストが実質O(レコード数)になる。結果は parse_sfen と
+    ビット単位で一致する。分岐レコード（pv_leaf/multipv由来、親局面 + 1手の
+    sfen）も同じ機構で拾える。親が見つからない場合は parse_sfen に
+    フォールバックする。
+
+    Args:
+        sfens: パースする sfen 文字列のリスト（対局順に並んでいると効率的）
+
+    Returns:
+        各 sfen に対応する ParsedPosition のリスト
+    """
+    cache: dict[str, tuple[torch.Tensor, torch.Tensor, int]] = {}
+    results: list[ParsedPosition] = []
+    for sfen in sfens:
+        key = sfen.strip()
+        entry: tuple[torch.Tensor, torch.Tensor, int] | None = None
+        parts = key.split()
+        # 末尾トークンが指し手（"moves" 以降に1手以上ある）場合のみ差分適用を試みる
+        if "moves" in parts and parts[-1] != "moves":
+            parent_key = " ".join(parts[:-1])
+            if parent_key.endswith(" moves"):
+                parent_key = parent_key[: -len(" moves")]
+            cached = cache.get(parent_key)
+            if cached is not None:
+                board, hand, turn = cached
+                board = board.clone()
+                hand = hand.clone()
+                apply_move(board, hand, parts[-1], turn)
+                entry = (board, hand, (turn + 1) % 2)
+        if entry is None:
+            parsed = parse_sfen(key)
+            entry = (parsed.board, parsed.hand, int(parsed.turn.item()))
+        cache[key] = entry
+        results.append(ParsedPosition(
+            board=entry[0],
+            hand=entry[1],
+            turn=torch.tensor(entry[2], dtype=torch.long),
+        ))
+    return results
+
+
 def child_sfen(parent_sfen: str, move: str) -> str:
     """親局面のsfenに指し手を1手追加した子局面のsfenを構築.
 
@@ -235,6 +281,13 @@ class ShogiValueDataset(Dataset):
         wdl_scale: cp→勝率変換のシグモイドスケール（デフォルト: 600）
         wdl_lambda: elmoブレンドの教師評価値の重み（デフォルト: 0.5）。
             target = wdl_lambda * 評価値勝率 + (1 - wdl_lambda) * 勝敗
+        cache_tensors: ロード時に全局面をテンソル化して保持するかどうか
+            （デフォルト: True）。Trueの場合、`__getitem__`は事前構築済み
+            テンソルのインデックス参照のみになり、SFENパースと特徴量計算の
+            繰り返しコストを避けられる（DataLoaderの高速化）。値は
+            cp_noise=0のときFalseと完全に同じ結果になる（cp_noiseは
+            毎回`__getitem__`で新規に付与されるためキャッシュされない）。
+            Falseにすると従来どおり毎回パースする（デバッグ・比較用）。
     """
 
     def __init__(
@@ -251,6 +304,7 @@ class ShogiValueDataset(Dataset):
         target_mode: str = "cp",
         wdl_scale: float = 600.0,
         wdl_lambda: float = 0.5,
+        cache_tensors: bool = True,
     ) -> None:
         if target_mode not in ("cp", "wdl"):
             raise ValueError(f"Unknown target_mode: {target_mode}")
@@ -267,9 +321,13 @@ class ShogiValueDataset(Dataset):
         self.target_mode = target_mode
         self.wdl_scale = wdl_scale
         self.wdl_lambda = wdl_lambda
+        self.cache_tensors = cache_tensors
         self.samples: list[dict] = []
 
         self._load_data()
+
+        if self.cache_tensors:
+            self._build_tensor_cache()
 
     def _load_data(self) -> None:
         """データファイルを読み込む."""
@@ -292,39 +350,68 @@ class ShogiValueDataset(Dataset):
 
                 self.samples.append(sample)
 
-    def __len__(self) -> int:
-        base_len = len(self.samples)
-        if self.augment_flip:
-            return base_len * 2  # 元データ + 左右反転
-        return base_len
+    def _build_tensor_cache(self) -> None:
+        """全サンプルの盤面テンソルを事前構築する.
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """指定インデックスのサンプルを取得.
+        normalize_turn / augment_flip / features は決定的変換なので
+        変換後の形でキャッシュする。value / outcome / cp_noise は
+        サンプルごとのスカラー計算なので __getitem__ に残す。
+        返される tensor はサンプル間で共有されるため、呼び出し側で
+        in-place 変更してはならない。
+        """
+        positions = parse_positions_incremental(
+            [s["sfen"] for s in self.samples]
+        )
+        boards: list[torch.Tensor] = []
+        hands: list[torch.Tensor] = []
+        turns: list[torch.Tensor] = []
+        flip_boards: list[torch.Tensor] = []
+        flip_hands: list[torch.Tensor] = []
+        for parsed in positions:
+            board, hand, turn = parsed.board, parsed.hand, parsed.turn
+            if self.normalize_turn:
+                board, hand, turn, _, _ = normalize_to_black_view(
+                    board, hand, turn, 0.0, 0.5
+                )
+            boards.append(board)
+            hands.append(hand)
+            turns.append(turn)
+            if self.augment_flip:
+                fb, fh = augment_horizontal_flip(board, hand)
+                flip_boards.append(fb)
+                flip_hands.append(fh)
+        self._boards = torch.stack(boards)
+        self._hands = torch.stack(hands)
+        self._turns = torch.stack(turns)
+        if self.augment_flip:
+            self._flip_boards = torch.stack(flip_boards)
+            self._flip_hands = torch.stack(flip_hands)
+        if self.use_features:
+            self._features = torch.stack([stack_features(b) for b in boards])
+            if self.augment_flip:
+                self._flip_features = torch.stack(
+                    [stack_features(b) for b in flip_boards]
+                )
+
+    def _targets(self, sample: dict) -> tuple[float, float, float]:
+        """サンプルからvalue/outcome/outcome_weightを計算する.
+
+        cp_noise・cp_clampの適用とtarget_mode変換をここに集約し、
+        cache_tensorsの有無に関わらず__getitem__の両経路で共有する
+        （ロジックの重複を避ける）。cp_noiseは呼び出しのたびに新しい
+        乱数を引くため、この結果をキャッシュしてはならない。
+
+        Note:
+            normalize_to_black_viewはvalue/outcomeを変更せず素通しする
+            ため、盤面の正規化前にこの関数でターゲットを計算しても
+            結果は変わらない。
 
         Args:
-            idx: サンプルインデックス
+            sample: JSONLの1レコード（辞書）
 
         Returns:
-            dict with keys:
-                - board: 盤面テンソル (81,)
-                - hand: 持ち駒テンソル (14,)
-                - turn: 手番テンソル ()
-                - value: 正規化評価値テンソル ()
-                - outcome: 勝敗ラベル (1.0: 手番側勝ち, 0.0: 手番側負け, 0.5: 引き分け)
-                - outcome_weight: 勝敗損失の重み ()。本譜局面=1.0、
-                  pv_leaf/multipv分岐局面=0.0（本譜勝敗が当てはまらないため）
-                - features: 拡張特徴量テンソル (81, 10) [use_features=True時のみ]
+            (value, outcome, outcome_weight) のタプル
         """
-        # 左右反転拡張: 後半のインデックスは反転版
-        apply_flip = False
-        if self.augment_flip:
-            base_len = len(self.samples)
-            if idx >= base_len:
-                idx = idx - base_len
-                apply_flip = True
-
-        sample = self.samples[idx]
-        sfen = sample["sfen"]
         score_cp = sample["score_cp"]
 
         # 評価値ノイズ付与（学習時の過学習抑制）
@@ -334,9 +421,6 @@ class ShogiValueDataset(Dataset):
         # 評価値クランプ（大差局面を除外せず丸めて学習に残す）
         if self.cp_clamp is not None:
             score_cp = max(-self.cp_clamp, min(self.cp_clamp, score_cp))
-
-        # SFENをパース
-        parsed = parse_sfen(sfen)
 
         # 勝敗ラベルを手番視点に変換
         result_str = sample.get("result", "draw")
@@ -366,19 +450,72 @@ class ShogiValueDataset(Dataset):
         else:
             value = normalize_cp(score_cp, self.cp_scale)
 
-        board = parsed.board
-        hand = parsed.hand
-        turn = parsed.turn
+        outcome_weight = 1.0 if has_real_outcome else 0.0
+        return value, outcome, outcome_weight
 
-        # 手番正規化: 後手番を先手視点に変換
-        if self.normalize_turn:
-            board, hand, turn, value, outcome = normalize_to_black_view(
-                board, hand, turn, value, outcome
-            )
+    def __len__(self) -> int:
+        base_len = len(self.samples)
+        if self.augment_flip:
+            return base_len * 2  # 元データ + 左右反転
+        return base_len
 
-        # 左右反転拡張
-        if apply_flip:
-            board, hand = augment_horizontal_flip(board, hand)
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """指定インデックスのサンプルを取得.
+
+        Args:
+            idx: サンプルインデックス
+
+        Returns:
+            dict with keys:
+                - board: 盤面テンソル (81,)
+                - hand: 持ち駒テンソル (14,)
+                - turn: 手番テンソル ()
+                - value: 正規化評価値テンソル ()
+                - outcome: 勝敗ラベル (1.0: 手番側勝ち, 0.0: 手番側負け, 0.5: 引き分け)
+                - outcome_weight: 勝敗損失の重み ()。本譜局面=1.0、
+                  pv_leaf/multipv分岐局面=0.0（本譜勝敗が当てはまらないため）
+                - features: 拡張特徴量テンソル (81, 10) [use_features=True時のみ]
+
+        Note:
+            cache_tensors=True時、board/hand/turn/featuresは全サンプルで
+            共有されるテンソルのビューを返す。呼び出し側でin-place変更
+            しないこと（clone()してから変更すること）。
+        """
+        # 左右反転拡張: 後半のインデックスは反転版
+        apply_flip = False
+        if self.augment_flip:
+            base_len = len(self.samples)
+            if idx >= base_len:
+                idx = idx - base_len
+                apply_flip = True
+
+        sample = self.samples[idx]
+
+        # value/outcome/outcome_weightの計算はキャッシュ有無で共通
+        value, outcome, outcome_weight = self._targets(sample)
+
+        if self.cache_tensors:
+            if apply_flip:
+                board = self._flip_boards[idx]
+                hand = self._flip_hands[idx]
+            else:
+                board = self._boards[idx]
+                hand = self._hands[idx]
+            turn = self._turns[idx]
+        else:
+            # SFENをパース
+            parsed = parse_sfen(sample["sfen"])
+            board, hand, turn = parsed.board, parsed.hand, parsed.turn
+
+            # 手番正規化: 後手番を先手視点に変換
+            if self.normalize_turn:
+                board, hand, turn, value, outcome = normalize_to_black_view(
+                    board, hand, turn, value, outcome
+                )
+
+            # 左右反転拡張
+            if apply_flip:
+                board, hand = augment_horizontal_flip(board, hand)
 
         result = {
             "board": board,
@@ -386,14 +523,17 @@ class ShogiValueDataset(Dataset):
             "turn": turn,
             "value": torch.tensor(value, dtype=torch.float32),
             "outcome": torch.tensor(outcome, dtype=torch.float32),
-            "outcome_weight": torch.tensor(
-                1.0 if has_real_outcome else 0.0, dtype=torch.float32
-            ),
+            "outcome_weight": torch.tensor(outcome_weight, dtype=torch.float32),
         }
 
         # 拡張特徴量を追加（変換後の盤面から計算）
         if self.use_features:
-            result["features"] = stack_features(board)
+            if self.cache_tensors:
+                result["features"] = (
+                    self._flip_features[idx] if apply_flip else self._features[idx]
+                )
+            else:
+                result["features"] = stack_features(board)
 
         return result
 
@@ -435,6 +575,40 @@ def prepare_pair_position(
     return result
 
 
+def cached_pair_position(
+    cache: dict[tuple[str, bool], dict[str, torch.Tensor]] | None,
+    sfen: str,
+    use_features: bool,
+    normalize_turn: bool,
+    apply_flip: bool,
+) -> dict[str, torch.Tensor]:
+    """prepare_pair_positionの結果をメモ化して返す.
+
+    ペアは局面の重複が多い（同一親の子局面が複数ペアに登場する）ため、
+    (sfen, apply_flip) キーで遅延メモ化する。cacheがNoneの場合はメモ化せず
+    毎回構築する。返されるdict内のtensorは呼び出し間で共有されるため、
+    呼び出し側でin-place変更してはならない。
+
+    Args:
+        cache: メモ化辞書（Noneでメモ化無効）
+        sfen: 局面
+        use_features: 拡張特徴量を付与するかどうか
+        normalize_turn: 後手番を先手視点に正規化するかどうか
+        apply_flip: 左右反転を適用するかどうか
+
+    Returns:
+        prepare_pair_positionと同一内容のdict
+    """
+    if cache is None:
+        return prepare_pair_position(sfen, use_features, normalize_turn, apply_flip)
+    key = (sfen, apply_flip)
+    pos = cache.get(key)
+    if pos is None:
+        pos = prepare_pair_position(sfen, use_features, normalize_turn, apply_flip)
+        cache[key] = pos
+    return pos
+
+
 class ShogiRankingPairDataset(Dataset):
     """MultiPV候補手ペアのrankingデータセット.
 
@@ -455,6 +629,10 @@ class ShogiRankingPairDataset(Dataset):
         cp_scale: delta_target計算（cpモード）の正規化スケール
         target_mode: delta_targetの値空間（"cp"または"wdl"）
         wdl_scale: delta_target計算（wdlモード）のシグモイドスケール
+        cache_tensors: 局面テンソルを遅延メモ化するかどうか（デフォルト: True）。
+            同一親の子局面が複数ペアに登場するため、(sfen, apply_flip)キーで
+            初回参照時にキャッシュし、以降の参照を高速化する。メモ化された
+            tensorは共有されるため呼び出し側でin-place変更してはならない。
     """
 
     def __init__(
@@ -469,6 +647,7 @@ class ShogiRankingPairDataset(Dataset):
         cp_scale: float = 1200.0,
         target_mode: str = "cp",
         wdl_scale: float = 600.0,
+        cache_tensors: bool = True,
     ) -> None:
         if target_mode not in ("cp", "wdl"):
             raise ValueError(f"Unknown target_mode: {target_mode}")
@@ -480,6 +659,9 @@ class ShogiRankingPairDataset(Dataset):
         self.cp_scale = cp_scale
         self.target_mode = target_mode
         self.wdl_scale = wdl_scale
+        self._pos_cache: dict[tuple[str, bool], dict[str, torch.Tensor]] | None = (
+            {} if cache_tensors else None
+        )
         # (親局面sfen, 良い手, 悪い手, 良い手のscore_cp, 悪い手のscore_cp)
         self.pairs: list[tuple[str, str, str, float, float]] = []
 
@@ -553,12 +735,12 @@ class ShogiRankingPairDataset(Dataset):
             self.pairs[idx]
         )
 
-        pos_a = prepare_pair_position(
-            child_sfen(parent_sfen, move_better),
+        pos_a = cached_pair_position(
+            self._pos_cache, child_sfen(parent_sfen, move_better),
             self.use_features, self.normalize_turn, apply_flip,
         )
-        pos_b = prepare_pair_position(
-            child_sfen(parent_sfen, move_worse),
+        pos_b = cached_pair_position(
+            self._pos_cache, child_sfen(parent_sfen, move_worse),
             self.use_features, self.normalize_turn, apply_flip,
         )
 
@@ -605,6 +787,9 @@ class ShogiDeltaPairDataset(Dataset):
         same_material_only: material_diff==0のペアのみ使用
         include_game_ids: 指定時、このgame_idのペアのみ使用（検証用）
         exclude_game_ids: 指定時、このgame_idのペアを除外（訓練用）
+        cache_tensors: 局面テンソルを遅延メモ化するかどうか（デフォルト: True）。
+            メモ化されたtensorは共有されるため呼び出し側でin-place変更しては
+            ならない。
     """
 
     def __init__(
@@ -619,6 +804,7 @@ class ShogiDeltaPairDataset(Dataset):
         same_material_only: bool = False,
         include_game_ids: set[int] | None = None,
         exclude_game_ids: set[int] | None = None,
+        cache_tensors: bool = True,
     ) -> None:
         if target_mode not in ("cp", "wdl"):
             raise ValueError(f"Unknown target_mode: {target_mode}")
@@ -631,6 +817,9 @@ class ShogiDeltaPairDataset(Dataset):
         self.target_mode = target_mode
         self.wdl_scale = wdl_scale
         self.same_material_only = same_material_only
+        self._pos_cache: dict[tuple[str, bool], dict[str, torch.Tensor]] | None = (
+            {} if cache_tensors else None
+        )
         # (sfen_a, sfen_b, score_cp_a, score_cp_b)
         self.pairs: list[tuple[str, str, float, float]] = []
 
@@ -693,11 +882,11 @@ class ShogiDeltaPairDataset(Dataset):
 
         sfen_a, sfen_b, score_a, score_b = self.pairs[idx]
 
-        pos_a = prepare_pair_position(
-            sfen_a, self.use_features, self.normalize_turn, apply_flip
+        pos_a = cached_pair_position(
+            self._pos_cache, sfen_a, self.use_features, self.normalize_turn, apply_flip
         )
-        pos_b = prepare_pair_position(
-            sfen_b, self.use_features, self.normalize_turn, apply_flip
+        pos_b = cached_pair_position(
+            self._pos_cache, sfen_b, self.use_features, self.normalize_turn, apply_flip
         )
 
         delta = value_target_from_cp(

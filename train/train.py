@@ -1127,6 +1127,12 @@ def train(config: TrainConfig) -> None:
     device = get_device(config.device)
     logger.info(f"Using device: {device}")
 
+    if config.num_workers > 0:
+        logger.info(
+            "データセットは事前テンソル化されるため、--num-workers 0 でも"
+            "十分高速です（ワーカー分のメモリ複製を回避できます）"
+        )
+
     if agreement_data_overlaps(config.data_path, config.agreement_data):
         logger.warning(
             "agreement_dataが学習データと同一ファイルです。"
