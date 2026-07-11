@@ -398,6 +398,43 @@ class ShogiValueDataset(Dataset):
         return result
 
 
+def prepare_pair_position(
+    sfen: str,
+    use_features: bool,
+    normalize_turn: bool,
+    apply_flip: bool,
+) -> dict[str, torch.Tensor]:
+    """ペアデータセット共通の1局面分モデル入力を作成.
+
+    Args:
+        sfen: 局面（"startpos [moves ...]" または "sfen ..."）
+        use_features: 拡張特徴量を付与するかどうか
+        normalize_turn: 後手番を先手視点に正規化するかどうか
+        apply_flip: 左右反転を適用するかどうか
+
+    Returns:
+        board/hand/turn（use_features時はfeaturesも）の辞書
+    """
+    parsed = parse_sfen(sfen)
+    board = parsed.board
+    hand = parsed.hand
+    turn = parsed.turn
+
+    if normalize_turn:
+        # ダミーのラベルを渡して盤面のみ正規化
+        board, hand, turn, _, _ = normalize_to_black_view(
+            board, hand, turn, 0.0, 0.5
+        )
+
+    if apply_flip:
+        board, hand = augment_horizontal_flip(board, hand)
+
+    result = {"board": board, "hand": hand, "turn": turn}
+    if use_features:
+        result["features"] = stack_features(board)
+    return result
+
+
 class ShogiRankingPairDataset(Dataset):
     """MultiPV候補手ペアのrankingデータセット.
 
@@ -493,29 +530,6 @@ class ShogiRankingPairDataset(Dataset):
             return base_len * 2
         return base_len
 
-    def _prepare_position(
-        self, sfen: str, apply_flip: bool
-    ) -> dict[str, torch.Tensor]:
-        """1局面分のモデル入力を作成（メインデータセットと同じ変換を適用）."""
-        parsed = parse_sfen(sfen)
-        board = parsed.board
-        hand = parsed.hand
-        turn = parsed.turn
-
-        if self.normalize_turn:
-            # ダミーのラベルを渡して盤面のみ正規化
-            board, hand, turn, _, _ = normalize_to_black_view(
-                board, hand, turn, 0.0, 0.5
-            )
-
-        if apply_flip:
-            board, hand = augment_horizontal_flip(board, hand)
-
-        result = {"board": board, "hand": hand, "turn": turn}
-        if self.use_features:
-            result["features"] = stack_features(board)
-        return result
-
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """指定インデックスのペアを取得.
 
@@ -539,8 +553,14 @@ class ShogiRankingPairDataset(Dataset):
             self.pairs[idx]
         )
 
-        pos_a = self._prepare_position(child_sfen(parent_sfen, move_better), apply_flip)
-        pos_b = self._prepare_position(child_sfen(parent_sfen, move_worse), apply_flip)
+        pos_a = prepare_pair_position(
+            child_sfen(parent_sfen, move_better),
+            self.use_features, self.normalize_turn, apply_flip,
+        )
+        pos_b = prepare_pair_position(
+            child_sfen(parent_sfen, move_worse),
+            self.use_features, self.normalize_turn, apply_flip,
+        )
 
         result = {
             "board_a": pos_a["board"],
@@ -560,6 +580,141 @@ class ShogiRankingPairDataset(Dataset):
         )
         result["delta_target"] = torch.tensor(delta, dtype=torch.float32)
 
+        if self.use_features:
+            result["features_a"] = pos_a["features"]
+            result["features_b"] = pos_b["features"]
+        return result
+
+
+class ShogiDeltaPairDataset(Dataset):
+    """摂動ペア（局面感度蒸留）のΔV回帰データセット.
+
+    gen_perturb_pairs.pyの出力JSONLを読み込む。score_cp_a/score_cp_bは
+    各局面自身の手番側視点（モデル出力と同じ視点）なので、
+    delta_target = n(score_a) − n(score_b) を符号反転なしで回帰する
+    （candidatesペアのdelta_targetとは規約が異なる点に注意）。
+
+    Args:
+        data_path: ペアJSONLのパス
+        use_features: 拡張特徴量を使用するかどうか
+        normalize_turn: 後手番を先手視点に正規化（メインデータセットと揃える）
+        augment_flip: 左右反転でペアを2倍に拡張
+        cp_scale: cpモードの正規化スケール
+        target_mode: 値ターゲット空間（"cp" / "wdl"）
+        wdl_scale: wdlモードのシグモイドスケール
+        same_material_only: material_diff==0のペアのみ使用
+        include_game_ids: 指定時、このgame_idのペアのみ使用（検証用）
+        exclude_game_ids: 指定時、このgame_idのペアを除外（訓練用）
+    """
+
+    def __init__(
+        self,
+        data_path: str | Path,
+        use_features: bool = False,
+        normalize_turn: bool = False,
+        augment_flip: bool = False,
+        cp_scale: float = 1200.0,
+        target_mode: str = "cp",
+        wdl_scale: float = 600.0,
+        same_material_only: bool = False,
+        include_game_ids: set[int] | None = None,
+        exclude_game_ids: set[int] | None = None,
+    ) -> None:
+        if target_mode not in ("cp", "wdl"):
+            raise ValueError(f"Unknown target_mode: {target_mode}")
+
+        self.data_path = Path(data_path)
+        self.use_features = use_features
+        self.normalize_turn = normalize_turn
+        self.augment_flip = augment_flip
+        self.cp_scale = cp_scale
+        self.target_mode = target_mode
+        self.wdl_scale = wdl_scale
+        self.same_material_only = same_material_only
+        # (sfen_a, sfen_b, score_cp_a, score_cp_b)
+        self.pairs: list[tuple[str, str, float, float]] = []
+
+        self._load_pairs(include_game_ids, exclude_game_ids)
+
+    def _load_pairs(
+        self,
+        include_game_ids: set[int] | None,
+        exclude_game_ids: set[int] | None,
+    ) -> None:
+        """ペアJSONLを読み込む."""
+        with open(self.data_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
+
+                game_id = sample.get("game_id", 0)
+                if (
+                    include_game_ids is not None
+                    and game_id not in include_game_ids
+                ):
+                    continue
+                if (
+                    exclude_game_ids is not None
+                    and game_id in exclude_game_ids
+                ):
+                    continue
+                if (
+                    self.same_material_only
+                    and sample.get("material_diff", 0) != 0
+                ):
+                    continue
+
+                self.pairs.append((
+                    sample["sfen_a"], sample["sfen_b"],
+                    float(sample["score_cp_a"]), float(sample["score_cp_b"]),
+                ))
+
+    def __len__(self) -> int:
+        base_len = len(self.pairs)
+        if self.augment_flip:
+            return base_len * 2
+        return base_len
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """指定インデックスのペアを取得.
+
+        Returns:
+            board_a/hand_a/turn_a/board_b/hand_b/turn_b/delta_targetの辞書
+            （use_features時はfeatures_a/features_bも）
+        """
+        apply_flip = False
+        if self.augment_flip:
+            base_len = len(self.pairs)
+            if idx >= base_len:
+                idx = idx - base_len
+                apply_flip = True
+
+        sfen_a, sfen_b, score_a, score_b = self.pairs[idx]
+
+        pos_a = prepare_pair_position(
+            sfen_a, self.use_features, self.normalize_turn, apply_flip
+        )
+        pos_b = prepare_pair_position(
+            sfen_b, self.use_features, self.normalize_turn, apply_flip
+        )
+
+        delta = value_target_from_cp(
+            score_a, self.target_mode, self.cp_scale, self.wdl_scale
+        ) - value_target_from_cp(
+            score_b, self.target_mode, self.cp_scale, self.wdl_scale
+        )
+
+        result = {
+            "board_a": pos_a["board"],
+            "hand_a": pos_a["hand"],
+            "turn_a": pos_a["turn"],
+            "board_b": pos_b["board"],
+            "hand_b": pos_b["hand"],
+            "turn_b": pos_b["turn"],
+            "delta_target": torch.tensor(delta, dtype=torch.float32),
+        }
         if self.use_features:
             result["features_a"] = pos_a["features"]
             result["features_b"] = pos_b["features"]

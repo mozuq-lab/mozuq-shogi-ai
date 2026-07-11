@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from models.dataset import (
+    ShogiDeltaPairDataset,
     ShogiRankingPairDataset,
     ShogiValueDataset,
     collate_fn,
+    prepare_pair_position,
     ranking_collate_fn,
     stack_features,
     value_target_from_cp,
@@ -24,7 +26,9 @@ __all__ = [
     "ValueTransformer",
     "ShogiValueDataset",
     "ShogiRankingPairDataset",
+    "ShogiDeltaPairDataset",
     "collate_fn",
+    "prepare_pair_position",
     "ranking_collate_fn",
     "stack_features",
     "value_target_from_cp",

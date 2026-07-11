@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from models import ShogiRankingPairDataset, ranking_collate_fn
+from models import ShogiDeltaPairDataset, ShogiRankingPairDataset, ranking_collate_fn
 from models.dataset import child_sfen
 from scripts.move_agreement import load_candidate_samples, measure_agreement_offline
 from train.train import compute_ranking_loss, select_val_games
@@ -292,3 +292,85 @@ class TestOfflineAgreement:
         summary = measure_agreement_offline(evaluator, ranking_data)
         assert summary["regret_mean_cp"] == pytest.approx(130.0)
         assert summary["regret_samples"] == 1
+
+
+@pytest.fixture
+def delta_pair_data(tmp_path: Path) -> Path:
+    """gen_perturb_pairs.py出力形式の小規模ペアデータを生成."""
+    records = [
+        # 手番側視点スコア: a=-30, b=-60 → delta_target = n(-30) − n(-60) > 0
+        {"sfen_a": "startpos moves 2g2f", "sfen_b": "startpos moves 7g7f",
+         "score_cp_a": -30, "score_cp_b": -60,
+         "pair_type": "rewind_branch", "game_id": 0, "material_diff": 0},
+        {"sfen_a": "startpos moves 2g2f 8c8d",
+         "sfen_b": "startpos moves 2g2f 3c3d",
+         "score_cp_a": 40, "score_cp_b": 10,
+         "pair_type": "move_dest", "game_id": 1, "material_diff": 90},
+    ]
+    path = tmp_path / "delta_pairs.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records))
+    return path
+
+
+class TestShogiDeltaPairDataset:
+    """ShogiDeltaPairDataset（摂動ペア）のテスト."""
+
+    def test_len_and_shapes(self, delta_pair_data: Path) -> None:
+        dataset = ShogiDeltaPairDataset(delta_pair_data)
+        assert len(dataset) == 2
+        item = dataset[0]
+        assert item["board_a"].shape == (81,)
+        assert item["hand_b"].shape == (14,)
+        assert item["turn_a"].item() == item["turn_b"].item()
+
+    def test_delta_target_no_sign_flip(self, delta_pair_data: Path) -> None:
+        # scoreは各局面自身の手番側視点なので符号反転しない
+        dataset = ShogiDeltaPairDataset(delta_pair_data, cp_scale=1200.0)
+        expected = math.tanh(-30 / 1200.0) - math.tanh(-60 / 1200.0)
+        assert dataset[0]["delta_target"].item() == pytest.approx(
+            expected, abs=1e-6
+        )
+
+    def test_same_material_only(self, delta_pair_data: Path) -> None:
+        dataset = ShogiDeltaPairDataset(
+            delta_pair_data, same_material_only=True
+        )
+        assert len(dataset) == 1
+
+    def test_game_id_filters(self, delta_pair_data: Path) -> None:
+        train_ds = ShogiDeltaPairDataset(
+            delta_pair_data, exclude_game_ids={0}
+        )
+        val_ds = ShogiDeltaPairDataset(
+            delta_pair_data, include_game_ids={0}
+        )
+        assert len(train_ds) == 1
+        assert len(val_ds) == 1
+
+    def test_augment_flip_doubles(self, delta_pair_data: Path) -> None:
+        dataset = ShogiDeltaPairDataset(delta_pair_data, augment_flip=True)
+        assert len(dataset) == 4
+        # 反転してもΔVターゲットは不変
+        assert dataset[2]["delta_target"].item() == pytest.approx(
+            dataset[0]["delta_target"].item()
+        )
+
+    def test_normalize_turn_forces_black_view(
+        self, delta_pair_data: Path
+    ) -> None:
+        # 後手番ペアも先手視点に正規化され、ΔVターゲットは不変
+        base = ShogiDeltaPairDataset(delta_pair_data)
+        dataset = ShogiDeltaPairDataset(delta_pair_data, normalize_turn=True)
+        for i in range(len(dataset)):
+            item = dataset[i]
+            assert item["turn_a"].item() == 0
+            assert item["turn_b"].item() == 0
+            assert item["delta_target"].item() == pytest.approx(
+                base[i]["delta_target"].item()
+            )
+
+    def test_collate_compatible(self, delta_pair_data: Path) -> None:
+        dataset = ShogiDeltaPairDataset(delta_pair_data)
+        batch = ranking_collate_fn([dataset[0], dataset[1]])
+        assert batch["board_a"].shape == (2, 81)
+        assert batch["delta_target"].shape == (2,)
