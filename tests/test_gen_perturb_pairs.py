@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
 import shogi
 
 from tools.gen_perturb_pairs import (
     board_perturb_pairs,
+    build_pairs,
     is_stable,
+    label_pairs,
+    load_mainline_records,
     material_balance,
     move_destination_pairs,
     promotion_pairs,
@@ -120,3 +127,113 @@ class TestIsStable:
     def test_zero_is_stable(self) -> None:
         assert is_stable(0, 100)
         assert is_stable(100, 0)
+
+
+class TestLabelPairs:
+    """label_pairs（エンジンラベル付け+安定性フィルタ）のテスト."""
+
+    @staticmethod
+    def _make_evaluate(scores: dict[str, dict[int, int]]):
+        def evaluate(sfen: str, nodes: int) -> int | None:
+            return scores.get(sfen, {}).get(nodes)
+        return evaluate
+
+    def test_labels_and_material_diff(self) -> None:
+        pairs = [{
+            "sfen_a": "startpos moves 2g2f",
+            "sfen_b": "startpos moves 7g7f",
+            "pair_type": "rewind_branch",
+            "game_id": 0,
+        }]
+        evaluate = self._make_evaluate({
+            "startpos moves 2g2f": {200: -30, 50: -20},
+            "startpos moves 7g7f": {200: -60, 50: -40},
+        })
+        labeled, dropped = label_pairs(
+            pairs, evaluate, label_nodes=200, stability_nodes=50
+        )
+        assert dropped == 0
+        assert len(labeled) == 1
+        assert labeled[0]["score_cp_a"] == -30
+        assert labeled[0]["score_cp_b"] == -60
+        # 序盤の歩の差し替えなので素材は一致
+        assert labeled[0]["material_diff"] == 0
+
+    def test_unstable_pair_dropped(self) -> None:
+        pairs = [{
+            "sfen_a": "startpos moves 2g2f",
+            "sfen_b": "startpos moves 7g7f",
+            "pair_type": "rewind_branch",
+            "game_id": 0,
+        }]
+        # ラベル探索と安定性探索で差分の符号が反転 → 破棄
+        evaluate = self._make_evaluate({
+            "startpos moves 2g2f": {200: -30, 50: -80},
+            "startpos moves 7g7f": {200: -60, 50: -40},
+        })
+        labeled, dropped = label_pairs(
+            pairs, evaluate, label_nodes=200, stability_nodes=50
+        )
+        assert labeled == []
+        assert dropped == 1
+
+    def test_turn_mismatch_raises(self) -> None:
+        pairs = [{
+            "sfen_a": "startpos",
+            "sfen_b": "startpos moves 7g7f",
+            "pair_type": "move_dest",
+            "game_id": 0,
+        }]
+        with pytest.raises(ValueError, match="手番"):
+            label_pairs(pairs, lambda s, n: 0, 200, 50)
+
+    def test_none_score_dropped(self) -> None:
+        pairs = [{
+            "sfen_a": "startpos moves 2g2f",
+            "sfen_b": "startpos moves 7g7f",
+            "pair_type": "rewind_branch",
+            "game_id": 0,
+        }]
+        labeled, dropped = label_pairs(pairs, lambda s, n: None, 200, 50)
+        assert labeled == []
+        assert dropped == 1
+
+
+class TestLoadAndBuild:
+    """load_mainline_records / build_pairsのテスト."""
+
+    @pytest.fixture
+    def data_path(self, tmp_path: Path) -> Path:
+        records = [
+            {
+                "sfen": "startpos", "score_cp": 50, "ply": 0, "game_id": 0,
+                "candidates": [
+                    {"move": "2g2f", "score_cp": 50, "rank": 1},
+                    {"move": "7g7f", "score_cp": 30, "rank": 2},
+                ],
+            },
+            {"sfen": "startpos moves 2g2f", "score_cp": -40, "ply": 1,
+             "game_id": 0},
+            # 分岐レコード（source付き）は本譜として扱わない
+            {"sfen": "startpos moves 2g2f 3c3d", "score_cp": 20, "ply": 2,
+             "game_id": 0, "source": "multipv"},
+            {"sfen": "startpos", "score_cp": 10, "ply": 0, "game_id": 1},
+        ]
+        path = tmp_path / "data.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records))
+        return path
+
+    def test_load_mainline_records(self, data_path: Path) -> None:
+        games = load_mainline_records(data_path)
+        assert set(games.keys()) == {0, 1}
+        assert len(games[0]) == 2  # source付きは除外
+        assert games[0][0]["ply"] == 0
+
+    def test_build_pairs_caps_per_game(self, data_path: Path) -> None:
+        games = load_mainline_records(data_path)
+        pairs = build_pairs(games, max_pairs_per_game=3, seed=42)
+        per_game: dict[int, int] = {}
+        for pair in pairs:
+            per_game[pair["game_id"]] = per_game.get(pair["game_id"], 0) + 1
+        assert all(count <= 3 for count in per_game.values())
+        assert len(pairs) > 0

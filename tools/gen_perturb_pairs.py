@@ -237,3 +237,190 @@ def is_stable(delta_label: int, delta_stability: int) -> bool:
     if delta_label == 0 or delta_stability == 0:
         return True
     return (delta_label > 0) == (delta_stability > 0)
+
+
+def label_pairs(
+    pairs: list[dict],
+    evaluate: Callable[[str, int], Optional[int]],
+    label_nodes: int,
+    stability_nodes: int,
+) -> tuple[list[dict], int]:
+    """ペア両局面をラベル付けし、安定性フィルタを通過したものを返す.
+
+    手番一致の検証とmaterial_diffの付与もここで行う。
+
+    Args:
+        pairs: sfen_a/sfen_b/pair_type/game_idを持つペアのリスト
+        evaluate: (sfen, nodes) → score_cp（手番側視点、評価不能はNone）
+        label_nodes: ラベル用探索のノード数
+        stability_nodes: 安定性確認用探索のノード数
+
+    Returns:
+        (ラベル付きペアのリスト, 破棄されたペア数)
+    """
+    labeled: list[dict] = []
+    dropped = 0
+    for pair in pairs:
+        board_a = board_from_sfen_line(pair["sfen_a"])
+        board_b = board_from_sfen_line(pair["sfen_b"])
+        if board_a.turn != board_b.turn:
+            raise ValueError(
+                f"ペアの手番が一致しません: "
+                f"{pair['sfen_a']} / {pair['sfen_b']}"
+            )
+
+        score_a = evaluate(pair["sfen_a"], label_nodes)
+        score_b = evaluate(pair["sfen_b"], label_nodes)
+        if score_a is None or score_b is None:
+            dropped += 1
+            continue
+
+        stab_a = evaluate(pair["sfen_a"], stability_nodes)
+        stab_b = evaluate(pair["sfen_b"], stability_nodes)
+        if (
+            stab_a is None
+            or stab_b is None
+            or not is_stable(score_a - score_b, stab_a - stab_b)
+        ):
+            dropped += 1
+            continue
+
+        labeled.append({
+            **pair,
+            "score_cp_a": score_a,
+            "score_cp_b": score_b,
+            "material_diff": (
+                material_balance(board_a) - material_balance(board_b)
+            ),
+        })
+    return labeled, dropped
+
+
+def load_mainline_records(data_path: Path) -> dict[int, list[dict]]:
+    """本譜レコード（sourceなし）をgame_idごとにply昇順で読み込む.
+
+    Args:
+        data_path: 学習JSONLのパス
+
+    Returns:
+        game_id → 本譜レコードのリスト（ply昇順）
+    """
+    games: dict[int, list[dict]] = defaultdict(list)
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("source") is not None:
+                continue
+            games[record.get("game_id", 0)].append(record)
+    for records in games.values():
+        records.sort(key=lambda r: r["ply"])
+    return games
+
+
+def build_pairs(
+    games: dict[int, list[dict]],
+    max_pairs_per_game: int,
+    seed: int,
+) -> list[dict]:
+    """全対局から摂動ペア候補を構築し、対局ごとに上限までサンプリングする.
+
+    Args:
+        games: game_id → 本譜レコードのリスト
+        max_pairs_per_game: 1対局あたりの最大ペア数
+        seed: サンプリング用シード
+
+    Returns:
+        ペア候補のリスト（ラベル未付与）
+    """
+    rng = random.Random(seed)
+    all_pairs: list[dict] = []
+    for game_id, records in sorted(games.items()):
+        game_pairs = rewind_branch_pairs(records)
+        for record in records:
+            game_pairs.extend(board_perturb_pairs(record, rng=rng))
+        if len(game_pairs) > max_pairs_per_game:
+            game_pairs = rng.sample(game_pairs, max_pairs_per_game)
+        all_pairs.extend(game_pairs)
+    return all_pairs
+
+
+def make_engine_evaluator(
+    engine: USIEngine,
+) -> Callable[[str, int], Optional[int]]:
+    """USIEngineをlabel_pairs用のevaluate関数に変換.
+
+    Args:
+        engine: 初期化済みのUSIEngine
+
+    Returns:
+        (sfen, nodes) → score_cp（詰みはmate_to_cpで±30000に変換）
+    """
+    def evaluate(sfen: str, nodes: int) -> Optional[int]:
+        engine_sfen, moves = engine_position_args(sfen)
+        engine.set_position(sfen=engine_sfen, moves=moves)
+        result = engine.go(nodes=nodes)
+        return mate_to_cp(result.score_cp, result.score_mate)
+    return evaluate
+
+
+def main() -> None:
+    """エントリーポイント."""
+    parser = argparse.ArgumentParser(description="摂動ペア生成（局面感度蒸留用）")
+    parser.add_argument("--data", type=str, required=True,
+                        help="入力JSONL（学習データ。game_idを引き継ぐ）")
+    parser.add_argument("-o", "--output", type=str, required=True,
+                        help="出力ペアJSONLのパス")
+    parser.add_argument("--engine-type", type=str, default="suisho5",
+                        choices=["suisho5", "hao"], help="ラベル付けエンジン")
+    parser.add_argument("--engine", type=str, default=None,
+                        help="エンジンパスの直接指定（--engine-typeより優先）")
+    parser.add_argument("--label-nodes", type=int, default=200000,
+                        help="ラベル用探索のノード数")
+    parser.add_argument("--stability-nodes", type=int, default=50000,
+                        help="安定性確認用探索のノード数")
+    parser.add_argument("--max-pairs-per-game", type=int, default=40,
+                        help="1対局あたりの最大ペア数")
+    parser.add_argument("--seed", type=int, default=42, help="サンプリング用シード")
+    args = parser.parse_args()
+
+    games = load_mainline_records(Path(args.data))
+    pairs = build_pairs(games, args.max_pairs_per_game, args.seed)
+    logger.info(f"Pair candidates: {len(pairs)} from {len(games)} games")
+
+    engine_path = (
+        Path(args.engine) if args.engine else get_engine_path(args.engine_type)
+    )
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with USIEngine(engine_path) as engine:
+        engine.init_usi()
+        engine.set_option("USI_OwnBook", False)
+        engine.is_ready()
+        labeled, dropped = label_pairs(
+            pairs,
+            make_engine_evaluator(engine),
+            args.label_nodes,
+            args.stability_nodes,
+        )
+
+    type_counts: dict[str, int] = {}
+    with open(output_path, "w", encoding="utf-8") as f:
+        for pair in labeled:
+            f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+            type_counts[pair["pair_type"]] = (
+                type_counts.get(pair["pair_type"], 0) + 1
+            )
+
+    logger.info(
+        f"Labeled pairs: {len(labeled)} (dropped by stability filter: "
+        f"{dropped}) -> {output_path}"
+    )
+    logger.info(f"Pair types: {type_counts}")
+
+
+if __name__ == "__main__":
+    main()
