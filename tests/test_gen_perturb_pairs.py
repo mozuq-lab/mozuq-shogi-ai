@@ -198,6 +198,24 @@ class TestLabelPairs:
         assert labeled == []
         assert dropped == 1
 
+    def test_none_stability_score_dropped(self) -> None:
+        pairs = [{
+            "sfen_a": "startpos moves 2g2f",
+            "sfen_b": "startpos moves 7g7f",
+            "pair_type": "rewind_branch",
+            "game_id": 0,
+        }]
+        # ラベル探索（nodes=200）は有効値、安定性探索（nodes=50）はNone → 破棄
+        evaluate = self._make_evaluate({
+            "startpos moves 2g2f": {200: -30},
+            "startpos moves 7g7f": {200: -60},
+        })
+        labeled, dropped = label_pairs(
+            pairs, evaluate, label_nodes=200, stability_nodes=50
+        )
+        assert labeled == []
+        assert dropped == 1
+
 
 class TestLoadAndBuild:
     """load_mainline_records / build_pairsのテスト."""
