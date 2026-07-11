@@ -321,3 +321,25 @@ class TestComputeOutcomeLoss:
 
         actual = compute_outcome_loss(pred, target, weight)
         assert actual.item() == pytest.approx(0.0)
+
+
+class TestAgreementOverlapWarning:
+    """holdout運用の同一ファイル検出のテスト."""
+
+    def test_same_file_detected(self, tmp_path: Path) -> None:
+        from train.train import agreement_data_overlaps
+        path = tmp_path / "data.jsonl"
+        path.write_text("{}")
+        assert agreement_data_overlaps(str(path), str(path))
+
+    def test_different_file(self, tmp_path: Path) -> None:
+        from train.train import agreement_data_overlaps
+        a = tmp_path / "a.jsonl"
+        b = tmp_path / "b.jsonl"
+        a.write_text("{}")
+        b.write_text("{}")
+        assert not agreement_data_overlaps(str(a), str(b))
+
+    def test_none_agreement_data(self) -> None:
+        from train.train import agreement_data_overlaps
+        assert not agreement_data_overlaps("data.jsonl", None)

@@ -624,6 +624,27 @@ def validate_ranking(
     return total_loss / total, correct / total
 
 
+def agreement_data_overlaps(data_path: str, agreement_data: str | None) -> bool:
+    """一致率計測データが学習データと同一ファイルかどうか判定.
+
+    学習データでの計測は生成条件レベルの過適合を検出できないため、
+    独立したholdoutデータの使用を促す警告に使う。
+
+    Args:
+        data_path: 学習データのパス
+        agreement_data: 一致率計測データのパス（未指定はNone）
+
+    Returns:
+        同一ファイルならTrue
+    """
+    if not agreement_data:
+        return False
+    try:
+        return Path(agreement_data).resolve() == Path(data_path).resolve()
+    except OSError:
+        return False
+
+
 def run_offline_agreement(
     checkpoint_path: Path,
     data_path: str,
@@ -905,6 +926,12 @@ def train(config: TrainConfig) -> None:
     device = get_device(config.device)
     logger.info(f"Using device: {device}")
 
+    if agreement_data_overlaps(config.data_path, config.agreement_data):
+        logger.warning(
+            "agreement_dataが学習データと同一ファイルです。"
+            "計測は独立したholdoutデータで行うことを推奨します"
+        )
+
     # データセットとメインのtrain/valローダー
     dataset, train_loader, val_loader = _build_main_loaders(config, device)
 
@@ -1032,7 +1059,8 @@ def train(config: TrainConfig) -> None:
                 logger.info(
                     f"Agreement (epoch {epoch + 1}): "
                     f"{result['agreement']:.3f} "
-                    f"(multipv_hit={result['multipv_hit_rate']:.3f})"
+                    f"(multipv_hit={result['multipv_hit_rate']:.3f}, "
+                    f"regret_mean={result['regret_mean_cp']:.1f}cp)"
                 )
                 # 計測結果を含めて保存し直す（checkpoint単体で一致率を参照可能に）
                 save_checkpoint(
@@ -1074,7 +1102,8 @@ def train(config: TrainConfig) -> None:
             f"(序盤={result['opening']['agreement']:.3f}, "
             f"中盤={result['middlegame']['agreement']:.3f}, "
             f"終盤={result['endgame']['agreement']:.3f}, "
-            f"multipv_hit={result['multipv_hit_rate']:.3f})"
+            f"multipv_hit={result['multipv_hit_rate']:.3f}, "
+            f"regret_mean={result['regret_mean_cp']:.1f}cp)"
         )
         # 計測結果を含めて保存し直す（checkpoint単体で一致率を参照可能に）
         save_checkpoint(
@@ -1105,7 +1134,8 @@ def train(config: TrainConfig) -> None:
             logger.info(
                 f"Agreement (best, epoch {best_epoch}): "
                 f"{best_result['agreement']:.3f} "
-                f"(multipv_hit={best_result['multipv_hit_rate']:.3f})"
+                f"(multipv_hit={best_result['multipv_hit_rate']:.3f}, "
+                f"regret_mean={best_result['regret_mean_cp']:.1f}cp)"
             )
 
         write_log(log_path, config, state)

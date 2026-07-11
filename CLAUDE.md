@@ -524,6 +524,19 @@ best_move, score = evaluator.find_best_move(board)
 val_lossより直接的に「強さ」を測る2つのスクリプト。改善を入れるたびに
 効果を数字で確認する。
 
+### 計測プロトコル（フェーズ間比較の固定条件）
+
+改善の効果比較は以下の固定条件で行う:
+
+- **独立holdout**: 学習に一切使わない専用JSONL（`gen_dataset.py`で別途生成、
+  MultiPV付き・固定シード）を`--agreement-data`とオフライン計測に使う。
+  学習データと同一ファイルを指定すると`train.py`が警告を出す。
+- **主指標はcp regret**: 教師視点での「最善手と選択手の評価差」。
+  一致率は同等手が複数ある局面でノイズが入るが、regretはそれを吸収する。
+  選択手がMultiPV候補外の局面はcensoredとして件数のみ記録。
+  詰みスコア対策として`--regret-clamp`（デフォルト1000cp）で丸めて集計。
+- 教師探索条件（MultiPV数・depth/nodes）と`--limit`・シードを揃える。
+
 ### 指し手一致率 (`scripts/move_agreement.py`)
 
 モデルの1手読みが選ぶ手と教師エンジンの最善手の一致率を測定。
@@ -542,6 +555,8 @@ PYTHONPATH=. python scripts/move_agreement.py \
     --data data/raw/dataset_mpv.jsonl \
     --offline --limit 200
 ```
+
+オフラインモードではcp regret（mean/median、ply帯別、censored数）も出力される。
 
 学習中の自動計測は `train.py --agreement-data` を参照。
 
