@@ -298,6 +298,79 @@ class TestTrainRanking:
         assert "delta_mae" in ranking_val[0]
         assert ranking_val[0]["delta_mae"] >= 0.0
 
+    def test_delta_loss_added_to_train_loss(
+        self, candidates_data: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """delta損失が実際に学習損失へ加算される（合成行の削除を検出）.
+
+        compute_delta_lossを「元の結果+1000」を返すspyに差し替え、
+        train_lossが通常あり得ない大きさ（+1000×0.5=+500/step）に
+        なることで、loss += delta_weight * delta_loss の行が
+        生きていることを検証する。
+        """
+        import train.train as train_mod
+
+        original = train_mod.compute_delta_loss
+        calls: list[int] = []
+
+        def spy(
+            value_a: torch.Tensor,
+            value_b: torch.Tensor,
+            delta_target: torch.Tensor,
+            huber_delta: float = 0.5,
+        ) -> torch.Tensor:
+            calls.append(1)
+            return original(value_a, value_b, delta_target, huber_delta) + 1000.0
+
+        monkeypatch.setattr(train_mod, "compute_delta_loss", spy)
+
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.0, delta_weight=0.5,
+        )
+        train_mod.train(config)
+
+        assert len(calls) > 0
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu",
+            weights_only=False,
+        )
+        assert ckpt["state"]["train_losses"][0] > 100.0
+
+    def test_delta_loss_not_computed_when_weight_zero(
+        self, candidates_data: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """delta_weight=0ならペアローダー有効でもdelta損失は計算されない.
+
+        ranking_weight=0.5でペアローダーは有効のまま、
+        ゲート条件 delta_weight > 0 が正しく働くことを検証する。
+        """
+        import train.train as train_mod
+
+        original = train_mod.compute_delta_loss
+        calls: list[int] = []
+
+        def spy(
+            value_a: torch.Tensor,
+            value_b: torch.Tensor,
+            delta_target: torch.Tensor,
+            huber_delta: float = 0.5,
+        ) -> torch.Tensor:
+            calls.append(1)
+            return original(value_a, value_b, delta_target, huber_delta)
+
+        monkeypatch.setattr(train_mod, "compute_delta_loss", spy)
+
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.5, delta_weight=0.0,
+        )
+        train_mod.train(config)
+
+        assert len(calls) == 0
+
     def test_ranking_single_game_raises(self, tmp_path: Path) -> None:
         """game_idが1対局のみのデータでranking有効化は明示エラー（リーク防止）."""
         import json
