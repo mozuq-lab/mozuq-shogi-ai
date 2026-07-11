@@ -225,21 +225,25 @@ def measure_agreement_offline(
     data_path: str | Path,
     limit: int | None = None,
     seed: int = 42,
+    regret_clamp: float = 1000.0,
 ) -> dict:
     """データのcandidates（MultiPV記録）を教師としてオフラインで一致率を測定.
 
     エンジンを起動しないため高速で、学習ループへの組み込みに適する。
     教師の最善手はcandidatesのrank 1、加えてモデルの手がcandidatesの
     いずれかに含まれる率（multipv_hit_rate）も測定する。
+    さらに、教師視点での最善手と選択手の評価差（cp regret）も
+    summarize_regretで集計する。
 
     Args:
         evaluator: 評価器（find_best_moveを持つオブジェクト）
         data_path: candidatesフィールド付きJSONLデータのパス
         limit: 測定局面数の上限（Noneで全局面）
         seed: サンプリング用シード
+        regret_clamp: cp regret集計時のclamp上限（cp、詰みスコア対策）
 
     Returns:
-        集計結果の辞書（agreement/ply帯別/multipv_hit_rate等）
+        集計結果の辞書（agreement/ply帯別/multipv_hit_rate/regret_*等）
     """
     samples = load_candidate_samples(data_path)
 
@@ -254,6 +258,7 @@ def measure_agreement_offline(
         samples = rng.sample(samples, limit)
 
     results: list[tuple[int, bool]] = []
+    regret_records: list[tuple[int, float | None]] = []
     hit_count = 0
     skipped = 0
 
@@ -266,14 +271,26 @@ def measure_agreement_offline(
             continue
 
         candidates = sample["candidates"]
-        teacher_move = min(candidates, key=lambda c: c["rank"])["move"]
-        candidate_moves = {c["move"] for c in candidates}
+        best = min(candidates, key=lambda c: c["rank"])
+        teacher_move = best["move"]
+        candidate_scores = {c["move"]: c.get("score_cp") for c in candidates}
 
         model_move, _ = evaluator.find_best_move(board)
 
-        results.append((sample.get("ply", 0), model_move == teacher_move))
-        if model_move in candidate_moves:
+        ply = sample.get("ply", 0)
+        results.append((ply, model_move == teacher_move))
+        if model_move in candidate_scores:
             hit_count += 1
+
+        # cp regret: 教師視点での最善手と選択手の評価差。
+        # 選択手が候補外（またはスコア欠損）の場合は下限しか分からないので
+        # censored（None）として記録する
+        best_score = best.get("score_cp")
+        chosen_score = candidate_scores.get(model_move)
+        if best_score is None or chosen_score is None:
+            regret_records.append((ply, None))
+        else:
+            regret_records.append((ply, float(best_score - chosen_score)))
 
     summary = summarize(results)
     summary["skipped"] = skipped
@@ -283,6 +300,7 @@ def measure_agreement_offline(
     )
     summary["mode"] = "offline"
     summary["data"] = str(data_path)
+    summary.update(summarize_regret(regret_records, clamp=regret_clamp))
     return summary
 
 
@@ -390,6 +408,8 @@ def main() -> None:
     parser.add_argument("--output", type=str, default=None, help="結果JSONの出力先")
     parser.add_argument("--offline", action="store_true",
                         help="データのcandidatesを教師にエンジン無しで測定")
+    parser.add_argument("--regret-clamp", type=float, default=1000.0,
+                        help="regret集計時のclamp上限（cp、詰みスコア対策）")
     args = parser.parse_args()
 
     limit = args.limit if args.limit > 0 else None
@@ -397,7 +417,8 @@ def main() -> None:
     if args.offline:
         evaluator = Evaluator(args.model, device=args.device)
         summary = measure_agreement_offline(
-            evaluator, args.data, limit=limit, seed=args.seed
+            evaluator, args.data, limit=limit, seed=args.seed,
+            regret_clamp=args.regret_clamp,
         )
         summary["model"] = str(args.model)
         header = "指し手一致率 (offline / MultiPV教師)"
@@ -421,6 +442,10 @@ def main() -> None:
     if "multipv_hit_rate" in summary:
         print(f"MultiPV hit: {summary['multipv_hit_rate']:.3f} "
               f"({summary['multipv_hit']}/{summary['total']})")
+    if "regret_mean_cp" in summary:
+        print(f"cp regret:  mean={summary['regret_mean_cp']:.1f} "
+              f"median={summary['regret_median_cp']:.1f} "
+              f"(censored={summary['regret_censored']})")
     print(f"スキップ: {summary['skipped']}")
 
     if args.output:

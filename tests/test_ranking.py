@@ -228,3 +228,19 @@ class TestOfflineAgreement:
         )
         with pytest.raises(ValueError):
             measure_agreement_offline(_FakeEvaluator("7g7f"), path)
+
+    def test_regret_zero_for_best_move(self, ranking_data: Path) -> None:
+        # "2g2f"はstartposのrank1（regret 0）。
+        # "startpos moves 2g2f"では候補外なのでcensored
+        evaluator = _FakeEvaluator("2g2f")
+        summary = measure_agreement_offline(evaluator, ranking_data)
+        assert summary["regret_mean_cp"] == pytest.approx(0.0)
+        assert summary["regret_samples"] == 1
+        assert summary["regret_censored"] == 1
+
+    def test_regret_nonzero_for_worse_move(self, ranking_data: Path) -> None:
+        # "9g9f"はstartposのrank3: regret = 50 − (−80) = 130cp
+        evaluator = _FakeEvaluator("9g9f")
+        summary = measure_agreement_offline(evaluator, ranking_data)
+        assert summary["regret_mean_cp"] == pytest.approx(130.0)
+        assert summary["regret_samples"] == 1
