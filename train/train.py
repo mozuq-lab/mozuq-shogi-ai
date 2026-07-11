@@ -32,6 +32,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from models import (
+    ShogiDeltaPairDataset,
     ShogiRankingPairDataset,
     ShogiValueDataset,
     ValueTransformer,
@@ -146,6 +147,12 @@ class TrainConfig:
     # Huber回帰する。rankingが順序のみ学ぶのに対し差分量まで合わせる
     delta_weight: float = 0.0
 
+    # 摂動ペアデータ（gen_perturb_pairs.py出力、Noneで無効）
+    # delta_weight > 0 のとき、candidatesペアに加えて摂動ペアのΔVも学習する
+    delta_data: str | None = None
+    # material_diff==0（素材一致）のペアのみ使用
+    delta_same_material_only: bool = False
+
     # オフライン指し手一致率の計測（Noneで無効）
     # candidatesフィールド付きJSONLを指定すると、定期checkpoint保存時と
     # 学習終了時にrank1手との一致率を計測してログに記録する
@@ -166,6 +173,8 @@ class TrainState:
     ranking_val: list[dict] = field(default_factory=list)
     # 指し手一致率の履歴（{"epoch", "agreement", ...}）
     agreement: list[dict] = field(default_factory=list)
+    # 摂動ペア検証メトリクス（epochごと: {"epoch", "mae"}）
+    delta_val: list[dict] = field(default_factory=list)
 
 
 def compute_value_loss(
@@ -469,6 +478,7 @@ def train_epoch(
     ranking_loader: DataLoader | None = None,
     ranking_weight: float = 0.0,
     delta_weight: float = 0.0,
+    delta_loader: DataLoader | None = None,
 ) -> float:
     """1エポック学習."""
     model.train()
@@ -477,6 +487,8 @@ def train_epoch(
 
     # rankingペアはメインバッチ1回につき1バッチ消費（尽きたら周回）
     ranking_iter = iter(ranking_loader) if ranking_loader is not None else None
+    # 摂動ペア（--delta-data）も同様にメインバッチ1回につき1バッチ消費
+    delta_iter = iter(delta_loader) if delta_loader is not None else None
 
     for batch in loader:
         board = batch["board"].to(device)
@@ -543,6 +555,21 @@ def train_epoch(
                     huber_delta,
                 )
 
+        # 摂動ペアのΔV差分回帰損失
+        perturb_loss: torch.Tensor | None = None
+        if delta_iter is not None:
+            try:
+                delta_batch = next(delta_iter)
+            except StopIteration:
+                delta_iter = iter(delta_loader)
+                delta_batch = next(delta_iter)
+            value_a, value_b = _ranking_forward(model, delta_batch, device)
+            perturb_loss = compute_delta_loss(
+                value_a, value_b,
+                delta_batch["delta_target"].to(device),
+                huber_delta,
+            )
+
         # 合計損失
         # variance_regを引くことで、stdを大きく維持するインセンティブを与える
         loss = value_loss + aux_loss_weight * outcome_loss - variance_reg_weight * variance_reg
@@ -550,6 +577,8 @@ def train_epoch(
             loss = loss + ranking_weight * ranking_loss
         if delta_loss is not None:
             loss = loss + delta_weight * delta_loss
+        if perturb_loss is not None:
+            loss = loss + delta_weight * perturb_loss
         loss.backward()
 
         # デバッグ: 勾配の確認
@@ -579,10 +608,14 @@ def train_epoch(
                 f", delta={delta_loss.item():.6f}"
                 if delta_loss is not None else ""
             )
+            perturb_str = (
+                f", perturb={perturb_loss.item():.6f}"
+                if perturb_loss is not None else ""
+            )
             logger.info(
                 f"Step {state.global_step}: loss={loss.item():.6f} "
                 f"(value={value_loss.item():.6f}, outcome={outcome_loss.item():.6f}, "
-                f"var_reg={variance_reg.item():.4f}{ranking_str}{delta_str})"
+                f"var_reg={variance_reg.item():.4f}{ranking_str}{delta_str}{perturb_str})"
             )
 
     return total_loss / num_batches
@@ -678,6 +711,33 @@ def validate_ranking(
     return total_loss / total, correct / total, total_delta_err / total
 
 
+@torch.no_grad()
+def validate_delta(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    """摂動ペアのΔV平均絶対誤差を計算.
+
+    Args:
+        model: 評価するモデル
+        loader: 摂動ペアの検証ローダー
+        device: デバイス
+
+    Returns:
+        ΔV平均絶対誤差
+    """
+    model.eval()
+    total_err = 0.0
+    total = 0
+    for batch in loader:
+        value_a, value_b = _ranking_forward(model, batch, device)
+        target = batch["delta_target"].to(device)
+        total_err += (value_a - value_b - target).abs().sum().item()
+        total += value_a.size(0)
+    return total_err / total if total else 0.0
+
+
 def agreement_data_overlaps(data_path: str, agreement_data: str | None) -> bool:
     """一致率計測データが学習データと同一ファイルかどうか判定.
 
@@ -742,6 +802,7 @@ def write_log(log_path: Path, config: TrainConfig, state: TrainState) -> None:
         "best_val_loss": state.best_val_loss,
         "ranking_val": state.ranking_val,
         "agreement": state.agreement,
+        "delta_val": state.delta_val,
     }
     with open(log_path, "w") as f:
         json.dump(log_data, f, indent=2)
@@ -928,6 +989,84 @@ def _build_ranking_loaders(
     return ranking_train_loader, ranking_val_loader
 
 
+def _build_delta_loaders(
+    config: TrainConfig,
+    dataset: ShogiValueDataset,
+    device: torch.device,
+) -> tuple[DataLoader | None, DataLoader | None]:
+    """摂動ペア（--delta-data）のtrain/val用DataLoaderを構築する.
+
+    メインデータセットと同じ対局分割を共有する。gen_perturb_pairs.pyは
+    入力JSONLのgame_idをペアへ引き継ぐため、学習データと同じJSONLから
+    生成したペアであれば検証対局由来のペアが訓練に混ざらない。
+
+    Args:
+        config: 学習設定
+        dataset: メインのShogiValueDataset（game_id分割の共有に使用）
+        device: 実行デバイス
+
+    Returns:
+        (訓練用DataLoader, 検証用DataLoader)。delta_data未指定または
+        delta_weight <= 0の場合は(None, None)。
+
+    Raises:
+        ValueError: 対局単位の分割を共有できない場合、
+            またはペアが1つも構築できない場合。
+    """
+    if not config.delta_data or config.delta_weight <= 0:
+        return None, None
+
+    game_ids = [s.get("game_id", 0) for s in dataset.samples]
+    val_games = select_val_games(game_ids, config.val_split)
+    if val_games is None:
+        raise ValueError(
+            "--delta-dataにはgame_idが2対局以上あるデータが必要です"
+        )
+
+    dataset_kwargs = dict(
+        use_features=config.use_features,
+        normalize_turn=config.normalize_turn,
+        cp_scale=config.cp_scale,
+        target_mode=config.target_mode,
+        wdl_scale=config.wdl_scale,
+        same_material_only=config.delta_same_material_only,
+    )
+    delta_train_dataset = ShogiDeltaPairDataset(
+        config.delta_data,
+        augment_flip=config.augment_flip,
+        exclude_game_ids=val_games,
+        **dataset_kwargs,
+    )
+    if len(delta_train_dataset) == 0:
+        raise ValueError(
+            f"--delta-dataからペアを構築できません: {config.delta_data}"
+        )
+
+    pair_batch_size = max(1, config.batch_size // 2)
+    delta_train_loader = _make_loader(
+        delta_train_dataset, pair_batch_size, True, ranking_collate_fn,
+        config, device,
+    )
+
+    delta_val_dataset = ShogiDeltaPairDataset(
+        config.delta_data,
+        augment_flip=False,
+        include_game_ids=val_games,
+        **dataset_kwargs,
+    )
+    delta_val_loader: DataLoader | None = None
+    if len(delta_val_dataset) > 0:
+        delta_val_loader = _make_loader(
+            delta_val_dataset, pair_batch_size, False, ranking_collate_fn,
+            config, device,
+        )
+    logger.info(
+        f"Delta pairs: train={len(delta_train_dataset)}, "
+        f"val={len(delta_val_dataset)}"
+    )
+    return delta_train_loader, delta_val_loader
+
+
 def _build_model_and_optimizer(
     config: TrainConfig, device: torch.device
 ) -> tuple[
@@ -1002,6 +1141,11 @@ def train(config: TrainConfig) -> None:
         config, dataset, device
     )
 
+    # 摂動ペアローダー（--delta-data、対局分割をメインと共有）
+    delta_train_loader, delta_val_loader = _build_delta_loaders(
+        config, dataset, device
+    )
+
     # モデル・EMAモデル・オプティマイザ・スケジューラ
     model, ema_model, optimizer, scheduler = _build_model_and_optimizer(
         config, device
@@ -1054,6 +1198,7 @@ def train(config: TrainConfig) -> None:
             ranking_loader=ranking_train_loader,
             ranking_weight=config.ranking_weight,
             delta_weight=config.delta_weight,
+            delta_loader=delta_train_loader,
         )
         state.train_losses.append(train_loss)
 
@@ -1081,6 +1226,12 @@ def train(config: TrainConfig) -> None:
                 f"Ranking val: loss={rank_loss:.6f}, "
                 f"pair_accuracy={rank_acc:.3f}, delta_mae={delta_mae:.4f}"
             )
+
+        # 摂動ペア検証（ΔV差分の予測誤差）
+        if delta_val_loader is not None:
+            delta_mae = validate_delta(eval_model, delta_val_loader, device)
+            state.delta_val.append({"epoch": epoch + 1, "mae": delta_mae})
+            logger.info(f"Delta val: mae={delta_mae:.4f}")
 
         # スケジューラ更新（warmup後）
         if epoch >= config.warmup_epochs:
@@ -1282,6 +1433,10 @@ def main() -> None:
                         help="ペアとして採用する最小評価値差（cp）")
     parser.add_argument("--delta-weight", type=float, default=0.0,
                         help="ΔV差分回帰損失の重み（0=無効。candidatesペアの評価値差分を回帰）")
+    parser.add_argument("--delta-data", type=str, default=None,
+                        help="摂動ペアJSONL（gen_perturb_pairs.py出力。--delta-weightと併用）")
+    parser.add_argument("--delta-same-material-only", action="store_true",
+                        help="素材一致（material_diff==0）の摂動ペアのみ使用")
 
     # オフライン指し手一致率
     parser.add_argument("--agreement-data", type=str, default=None,

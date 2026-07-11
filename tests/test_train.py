@@ -394,6 +394,39 @@ class TestTrainRanking:
         with pytest.raises(ValueError, match="game_id"):
             train(config)
 
+    def test_train_with_delta_data(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """摂動ペアデータ付きで学習が完了し、delta検証が記録される."""
+        import json
+
+        pairs = [
+            {"sfen_a": "startpos moves 7g7f",
+             "sfen_b": "startpos moves 2g2f",
+             "score_cp_a": -30, "score_cp_b": -50,
+             "pair_type": "rewind_branch", "game_id": gid,
+             "material_diff": 0}
+            for gid in range(3)
+        ]
+        delta_path = tmp_path / "pairs.jsonl"
+        delta_path.write_text("\n".join(json.dumps(p) for p in pairs))
+
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.0, delta_weight=0.3,
+            delta_data=str(delta_path),
+        )
+        train(config)
+
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu",
+            weights_only=False,
+        )
+        assert ckpt["config"]["delta_data"] == str(delta_path)
+        delta_val = ckpt["state"]["delta_val"]
+        assert len(delta_val) == config.epochs
+        assert delta_val[0]["mae"] >= 0.0
+
 
 class TestComputeOutcomeLoss:
     """重み付き勝敗損失（source別マスク）のテスト."""

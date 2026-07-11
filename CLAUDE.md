@@ -324,6 +324,33 @@ PYTHONPATH=. python train/train.py --data data_mpv.jsonl --ranking-weight 0.3
 - 訓練/検証はメインデータと同じ対局単位分割を共有（リーク防止）
 - 検証時はペア正答率（pair_accuracy）をエポックごとにログ出力
 
+### 局面感度蒸留（ΔV差分回帰）
+
+似た局面ペアの「評価値の差分」を教師差分に合わせる補助損失。
+1手読みの手選びはargmaxで決まるため、差分方向の誤差を直接抑える。
+
+```bash
+# candidatesペアの差分回帰（データ再生成不要）
+python train/train.py --data data_mpv.jsonl --delta-weight 0.3
+
+# 摂動ペアの生成（安全リスト内の摂動 + 安定性フィルタ）
+python tools/gen_perturb_pairs.py \
+    --data data/raw/dataset_mpv.jsonl \
+    -o data/raw/perturb_pairs.jsonl
+
+# 摂動ペアも使った学習
+python train/train.py --data data_mpv.jsonl \
+    --delta-weight 0.3 --delta-data data/raw/perturb_pairs.jsonl
+```
+
+- ペア種別: rewind_branch（本譜vs分岐）/ move_dest（移動先違い）/
+  promotion（成/不成、素材一致）
+- エンジンで2回評価（`--label-nodes` / `--stability-nodes`）し、
+  差分の符号が反転するペアはノイズとして破棄
+- `material_diff`が記録され、`--delta-same-material-only`で素材一致
+  ペアのみに絞れる（駒価値で説明できる差分を除き、位置の感度に集中）
+- 訓練/検証は入力JSONLのgame_idを引き継いでメインと同じ対局分割を共有
+
 ### オフライン指し手一致率の自動計測
 
 `--agreement-data` にcandidatesフィールド付きJSONLを指定すると、
@@ -428,6 +455,9 @@ PYTHONPATH=. python train/train.py \
 | `--use-discrete-hand` | - | 持ち駒枚数を離散埋め込みで表現 |
 | `--ranking-weight` | 0 | pairwise ranking損失の重み（0=無効、candidatesフィールド必須） |
 | `--ranking-min-gap` | 30 | rankingペアの最小評価値差（cp、これ未満はノイズとして除外） |
+| `--delta-weight` | 0 | ΔV差分回帰損失の重み（0=無効、candidatesペアの評価値差分を回帰） |
+| `--delta-data` | なし | 摂動ペアJSONL（gen_perturb_pairs.py出力） |
+| `--delta-same-material-only` | - | 素材一致の摂動ペアのみ使用 |
 | `--agreement-data` | なし | オフライン一致率計測用のcandidatesフィールド付きJSONL |
 | `--agreement-limit` | 200 | 一致率計測の局面数上限 |
 
@@ -617,6 +647,15 @@ PYTHONPATH=. python scripts/selfplay_match.py \
 - [x] **オフライン指し手一致率の自動計測** - 「val_lossは下がったが弱い」の早期検出
   - `scripts/move_agreement.py`: `--offline`モード（candidates教師、エンジン不要）
   - `train.py`: `--agreement-data`で定期保存時と学習終了時に自動計測・ログ記録
+
+- [x] **cp regret計測** - 一致率より頑健な手選び指標（censored集計・clamp付き）
+  - `move_agreement.py`: `--regret-clamp`オプション、`summarize_regret`
+  - `train.py`: 自動計測ログにregretを記録、holdout同一ファイル警告
+
+- [x] **局面感度蒸留（ΔV差分回帰）** - 似た局面間の評価差を直接学習
+  - `train.py`: `--delta-weight` / `--delta-data` / `--delta-same-material-only`
+  - `tools/gen_perturb_pairs.py`: 安全リスト内の摂動ペア生成+安定性フィルタ
+  - `models/dataset.py`: `ShogiDeltaPairDataset`、candidatesペアのdelta_target
 
 - [ ] **重み付き損失（nodes基準）** - 難しい局面を重視
   - `gen_dataset.py`: 探索ノード数をJSONLに保存（SearchResultに既存）
