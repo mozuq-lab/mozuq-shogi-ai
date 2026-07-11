@@ -371,6 +371,36 @@ class TestTrainRanking:
 
         assert len(calls) == 0
 
+    def test_train_with_ranking_and_delta(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """ranking損失とdelta損失を同時有効化しても学習が完了する.
+
+        CLAUDE.mdが本番A/Bコマンドとして掲げる
+        `--ranking-weight 0.3 --delta-weight 0.3`の組み合わせで、
+        checkpointに両方の重みが記録され、ranking_valの各エントリに
+        accuracy（ranking由来）とdelta_mae（delta由来）の両方が
+        含まれることを確認する。
+        """
+        config = _small_config(
+            candidates_data, tmp_path / "ckpt",
+            ranking_weight=0.3, delta_weight=0.3, ranking_min_gap=30.0,
+        )
+        train(config)
+
+        ckpt = torch.load(
+            tmp_path / "ckpt" / "final.pt", map_location="cpu",
+            weights_only=False,
+        )
+        assert ckpt["config"]["ranking_weight"] == 0.3
+        assert ckpt["config"]["delta_weight"] == 0.3
+
+        ranking_val = ckpt["state"]["ranking_val"]
+        assert len(ranking_val) == config.epochs
+        for entry in ranking_val:
+            assert 0.0 <= entry["accuracy"] <= 1.0
+            assert entry["delta_mae"] >= 0.0
+
     def test_ranking_single_game_raises(self, tmp_path: Path) -> None:
         """game_idが1対局のみのデータでranking有効化は明示エラー（リーク防止）."""
         import json

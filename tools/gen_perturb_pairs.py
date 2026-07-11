@@ -249,6 +249,10 @@ def label_pairs(
 
     手番一致の検証とmaterial_diffの付与もここで行う。
 
+    同一(sfen, nodes)の評価はキャッシュされ1回だけ実行される
+    （rewind_branchペアではsfen_a（本譜の次局面）が候補手の数だけ
+    再評価され得るため、最もコストの高い探索の重複実行を避ける）。
+
     Args:
         pairs: sfen_a/sfen_b/pair_type/game_idを持つペアのリスト
         evaluate: (sfen, nodes) → score_cp（手番側視点、評価不能はNone）
@@ -258,6 +262,14 @@ def label_pairs(
     Returns:
         (ラベル付きペアのリスト, 破棄されたペア数)
     """
+    cache: dict[tuple[str, int], Optional[int]] = {}
+
+    def cached_evaluate(sfen: str, nodes: int) -> Optional[int]:
+        key = (sfen, nodes)
+        if key not in cache:
+            cache[key] = evaluate(sfen, nodes)
+        return cache[key]
+
     labeled: list[dict] = []
     dropped = 0
     for pair in pairs:
@@ -269,14 +281,14 @@ def label_pairs(
                 f"{pair['sfen_a']} / {pair['sfen_b']}"
             )
 
-        score_a = evaluate(pair["sfen_a"], label_nodes)
-        score_b = evaluate(pair["sfen_b"], label_nodes)
+        score_a = cached_evaluate(pair["sfen_a"], label_nodes)
+        score_b = cached_evaluate(pair["sfen_b"], label_nodes)
         if score_a is None or score_b is None:
             dropped += 1
             continue
 
-        stab_a = evaluate(pair["sfen_a"], stability_nodes)
-        stab_b = evaluate(pair["sfen_b"], stability_nodes)
+        stab_a = cached_evaluate(pair["sfen_a"], stability_nodes)
+        stab_b = cached_evaluate(pair["sfen_b"], stability_nodes)
         if (
             stab_a is None
             or stab_b is None

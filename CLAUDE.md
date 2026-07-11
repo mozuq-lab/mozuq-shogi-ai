@@ -350,6 +350,8 @@ python train/train.py --data data_mpv.jsonl \
 - `material_diff`が記録され、`--delta-same-material-only`で素材一致
   ペアのみに絞れる（駒価値で説明できる差分を除き、位置の感度に集中）
 - 訓練/検証は入力JSONLのgame_idを引き継いでメインと同じ対局分割を共有
+- `--delta-weight`を有効にするとcandidatesペアのローダーも駆動するため、
+  メインの`--data`にはcandidates付きデータ（`--multipv` 2以上で生成）が必要
 
 ### オフライン指し手一致率の自動計測
 

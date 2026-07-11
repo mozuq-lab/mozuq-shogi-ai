@@ -198,6 +198,50 @@ class TestLabelPairs:
         assert labeled == []
         assert dropped == 1
 
+    def test_shared_sfen_a_is_memoized(self) -> None:
+        """同一(sfen, nodes)は複数ペアにまたがってもevaluateが1回だけ呼ばれる.
+
+        rewind_branchペアでは本譜の次局面（sfen_a）が候補手の数だけ
+        繰り返し登場する。最もコストの高いlabel_nodesの探索が
+        重複実行されないことを、呼び出し回数を数えるfake evaluateで検証する。
+        """
+        calls: list[tuple[str, int]] = []
+        scores = {
+            "startpos moves 2g2f": {200: -30, 50: -20},
+            "startpos moves 7g7f": {200: -60, 50: -40},
+            "startpos moves 6g6f": {200: -55, 50: -35},
+        }
+
+        def evaluate(sfen: str, nodes: int) -> int | None:
+            calls.append((sfen, nodes))
+            return scores.get(sfen, {}).get(nodes)
+
+        # 2ペアがsfen_a（本譜の次局面）を共有する
+        pairs = [
+            {
+                "sfen_a": "startpos moves 2g2f",
+                "sfen_b": "startpos moves 7g7f",
+                "pair_type": "rewind_branch",
+                "game_id": 0,
+            },
+            {
+                "sfen_a": "startpos moves 2g2f",
+                "sfen_b": "startpos moves 6g6f",
+                "pair_type": "rewind_branch",
+                "game_id": 0,
+            },
+        ]
+        labeled, dropped = label_pairs(
+            pairs, evaluate, label_nodes=200, stability_nodes=50
+        )
+        assert dropped == 0
+        assert len(labeled) == 2
+
+        # ユニークな(sfen, nodes)の数だけしかevaluateが呼ばれない
+        unique_keys = {(sfen, nodes) for sfen, nodes in calls}
+        assert len(unique_keys) == 6  # {2g2f,7g7f,6g6f} x {200,50}
+        assert len(calls) == len(unique_keys)
+
     def test_none_stability_score_dropped(self) -> None:
         pairs = [{
             "sfen_a": "startpos moves 2g2f",
