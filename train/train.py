@@ -480,7 +480,15 @@ def train_epoch(
     delta_weight: float = 0.0,
     delta_loader: DataLoader | None = None,
 ) -> float:
-    """1エポック学習."""
+    """1エポック学習.
+
+    損失成分ごとに逐次backwardしてピークGPUメモリを抑える
+    （勾配は合算方式と等価）。本体損失・rankingペア損失・摂動ペア損失を
+    それぞれforward直後にbackwardし、勾配を積んでからoptimizer.step()する。
+    「和の勾配 = 勾配の和」のため合算してから1回backwardする方式と
+    数学的に等価だが、各backward後にその成分の計算グラフが解放されるため、
+    ピークGPUメモリは「3本の合計」から「最大の1本」に下がる。
+    """
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -534,7 +542,18 @@ def train_epoch(
         # 出力の標準偏差が小さいとペナルティ（負の項なので最大化される）
         variance_reg = value.std()
 
-        # Pairwise ranking損失 + ΔV差分回帰損失（同じforwardを共有）
+        # ① 本体損失（value + outcome + 分散正則化）→ 即backward
+        #    ここでbackwardすることで本体の計算グラフが解放され、
+        #    rankingペア・摂動ペアのforward時にピークメモリへ加算されない
+        main_loss = (
+            value_loss
+            + aux_loss_weight * outcome_loss
+            - variance_reg_weight * variance_reg
+        )
+        main_loss.backward()
+
+        # ② rankingペア: 1回のforwardをranking損失とΔV損失で共有し、
+        #    重み付き和をbackward
         ranking_loss: torch.Tensor | None = None
         delta_loss: torch.Tensor | None = None
         if ranking_iter is not None:
@@ -546,16 +565,22 @@ def train_epoch(
             value_better, value_worse = _ranking_forward(
                 model, ranking_batch, device
             )
+            pair_loss: torch.Tensor | None = None
             if ranking_weight > 0:
                 ranking_loss = compute_ranking_loss(value_better, value_worse)
+                pair_loss = ranking_weight * ranking_loss
             if delta_weight > 0 and "delta_target" in ranking_batch:
                 delta_loss = compute_delta_loss(
                     value_better, value_worse,
                     ranking_batch["delta_target"].to(device),
                     huber_delta,
                 )
+                weighted = delta_weight * delta_loss
+                pair_loss = weighted if pair_loss is None else pair_loss + weighted
+            if pair_loss is not None:
+                pair_loss.backward()
 
-        # 摂動ペアのΔV差分回帰損失
+        # ③ 摂動ペア: forward → 重み付きbackward
         perturb_loss: torch.Tensor | None = None
         if delta_iter is not None:
             try:
@@ -569,19 +594,18 @@ def train_epoch(
                 delta_batch["delta_target"].to(device),
                 huber_delta,
             )
+            (delta_weight * perturb_loss).backward()
 
-        # 合計損失
-        # variance_regを引くことで、stdを大きく維持するインセンティブを与える
-        loss = value_loss + aux_loss_weight * outcome_loss - variance_reg_weight * variance_reg
+        # 合計損失のスカラー値（従来のloss.item()と同じ定義。ログ・平均用）
+        step_loss = main_loss.item()
         if ranking_loss is not None:
-            loss = loss + ranking_weight * ranking_loss
+            step_loss += ranking_weight * ranking_loss.item()
         if delta_loss is not None:
-            loss = loss + delta_weight * delta_loss
+            step_loss += delta_weight * delta_loss.item()
         if perturb_loss is not None:
-            loss = loss + delta_weight * perturb_loss
-        loss.backward()
+            step_loss += delta_weight * perturb_loss.item()
 
-        # デバッグ: 勾配の確認
+        # デバッグ: 勾配の確認（全backward完了後、clipの直前）
         if is_debug_step:
             grad_norm = sum(p.grad.norm() for p in model.parameters() if p.grad is not None)
             logger.info(f"Total grad norm: {grad_norm:.4f}")
@@ -595,7 +619,7 @@ def train_epoch(
         if ema_model is not None:
             ema_model.update_parameters(model)
 
-        total_loss += loss.item()
+        total_loss += step_loss
         num_batches += 1
         state.global_step += 1
 
@@ -613,7 +637,7 @@ def train_epoch(
                 if perturb_loss is not None else ""
             )
             logger.info(
-                f"Step {state.global_step}: loss={loss.item():.6f} "
+                f"Step {state.global_step}: loss={step_loss:.6f} "
                 f"(value={value_loss.item():.6f}, outcome={outcome_loss.item():.6f}, "
                 f"var_reg={variance_reg.item():.4f}{ranking_str}{delta_str}{perturb_str})"
             )

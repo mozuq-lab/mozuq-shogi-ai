@@ -520,3 +520,125 @@ class TestAgreementOverlapWarning:
     def test_none_agreement_data(self) -> None:
         from train.train import agreement_data_overlaps
         assert not agreement_data_overlaps("data.jsonl", None)
+
+
+class TestSequentialBackwardEquivalence:
+    """逐次backwardが合算backwardと同じ勾配を生むことの検証."""
+
+    def test_gradients_match_combined_backward(
+        self, candidates_data: Path, tmp_path: Path
+    ) -> None:
+        """train_epochの勾配が「損失合算→1回backward」の参照実装と一致する."""
+        import copy
+        import json
+
+        from torch.optim import SGD
+        from torch.utils.data import DataLoader
+
+        from models import (
+            ShogiDeltaPairDataset,
+            ShogiRankingPairDataset,
+            ShogiValueDataset,
+            ValueTransformer,
+            collate_fn,
+            ranking_collate_fn,
+        )
+        from train.train import (
+            TrainState,
+            _ranking_forward,
+            compute_delta_loss,
+            compute_outcome_loss,
+            compute_ranking_loss,
+            compute_value_loss,
+            train_epoch,
+        )
+
+        # 摂動ペアデータ（candidates_dataの3対局に対応するgame_id）
+        pairs = [
+            {"sfen_a": "startpos moves 7g7f",
+             "sfen_b": "startpos moves 2g2f",
+             "score_cp_a": -30, "score_cp_b": -50,
+             "pair_type": "rewind_branch", "game_id": gid,
+             "material_diff": 0}
+            for gid in range(3)
+        ]
+        delta_path = tmp_path / "pairs.jsonl"
+        delta_path.write_text("\n".join(json.dumps(p) for p in pairs))
+
+        main_ds = ShogiValueDataset(candidates_data)
+        rank_ds = ShogiRankingPairDataset(candidates_data, min_gap_cp=30.0)
+        delta_ds = ShogiDeltaPairDataset(delta_path)
+
+        def make_loader(ds, collate):
+            # 全データ1バッチ・シャッフルなしで決定的にする
+            return DataLoader(
+                ds, batch_size=len(ds), shuffle=False, collate_fn=collate
+            )
+
+        main_loader = make_loader(main_ds, collate_fn)
+        rank_loader = make_loader(rank_ds, ranking_collate_fn)
+        delta_loader = make_loader(delta_ds, ranking_collate_fn)
+
+        # dropout=0で決定的に。小さいモデルで十分
+        model = ValueTransformer(
+            d_model=32, n_heads=2, n_layers=1, ffn_dim=64, dropout=0.0
+        )
+        model_ref = copy.deepcopy(model)
+        device = torch.device("cpu")
+
+        ranking_weight = 0.3
+        delta_weight = 0.4
+        aux_loss_weight = 0.1
+
+        # --- 実装側: train_epoch（lr=0でstepが重みを変えない、clip無効化） ---
+        train_epoch(
+            model, main_loader, SGD(model.parameters(), lr=0.0), device,
+            TrainState(), log_every=10_000,
+            aux_loss_weight=aux_loss_weight,
+            grad_clip_norm=1e9,
+            label_smoothing=0.0,
+            ranking_loader=rank_loader,
+            ranking_weight=ranking_weight,
+            delta_weight=delta_weight,
+            delta_loader=delta_loader,
+        )
+
+        # --- 参照側: 同じバッチで損失を合算して1回backward ---
+        model_ref.train()
+        batch = next(iter(main_loader))
+        rank_batch = next(iter(rank_loader))
+        delta_batch = next(iter(delta_loader))
+
+        value, outcome = model_ref(
+            batch["board"], batch["hand"], batch["turn"], None
+        )
+        value_loss = compute_value_loss(
+            value.view(-1, 1), batch["value"].unsqueeze(1)
+        )
+        outcome_loss = compute_outcome_loss(
+            outcome.view(-1, 1), batch["outcome"].unsqueeze(1),
+            batch["outcome_weight"].unsqueeze(1),
+        )
+        vb, vw = _ranking_forward(model_ref, rank_batch, device)
+        ranking_loss = compute_ranking_loss(vb, vw)
+        delta_loss = compute_delta_loss(vb, vw, rank_batch["delta_target"])
+        va, vb2 = _ranking_forward(model_ref, delta_batch, device)
+        perturb_loss = compute_delta_loss(va, vb2, delta_batch["delta_target"])
+
+        total = (
+            value_loss
+            + aux_loss_weight * outcome_loss
+            + ranking_weight * ranking_loss
+            + delta_weight * delta_loss
+            + delta_weight * perturb_loss
+        )
+        total.backward()
+
+        # --- 勾配比較 ---
+        for (name, p), (_, p_ref) in zip(
+            model.named_parameters(), model_ref.named_parameters()
+        ):
+            assert p.grad is not None, name
+            assert torch.allclose(p.grad, p_ref.grad, rtol=1e-5, atol=1e-7), (
+                f"gradient mismatch: {name}"
+            )
